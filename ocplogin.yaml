@@ -1,0 +1,41 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    ocp_api_url: "https://api.ocp-uat.linux-plus.local:6443"
+    ocp_username: "kubeadmin"
+    ocp_password: "w6U5e-8aZQZ-eJLvE-DdEKj"
+    ocp_verify_ssl: false   
+  tasks:
+    - name: Authenticate to OpenShift and obtain a token
+      community.okd.openshift_auth:
+        host: "{{ ocp_api_url }}"
+        username: "{{ ocp_username }}"
+        password: "{{ ocp_password }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        ca_cert: "{{ ocp_ca_cert | default(omit) }}"
+      register: auth
+
+    - name: Sanity check (list namespaces using the token)
+      kubernetes.core.k8s_info:
+        host: "{{ ocp_api_url }}"
+        api_key: "{{ auth.openshift_auth.api_key }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        ca_cert: "{{ ocp_ca_cert | default(omit) }}"
+        api_version: v1
+        kind: Namespace
+      register: ns
+
+    - name: Assert we are authenticated
+      assert:
+        that:
+          - ns.resources is defined
+        success_msg: "Login OK; namespaces visible: {{ ns.resources | length }}"
+        fail_msg: "Login failed or no namespaces returned"
+
+    - name: Logout (tidy up the token on the API server)
+      community.okd.openshift_auth:
+        state: absent
+        api_key: "{{ auth.openshift_auth.api_key }}"
+        host: "{{ ocp_api_url }}"
+        validate_certs: "{{ ocp_verify_ssl }}"
+        ca_cert: "{{ ocp_ca_cert | default(omit) }}"
