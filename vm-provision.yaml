@@ -1,0 +1,122 @@
+---
+- name: provision vcenter playbook
+  hosts: localhost
+  vars_files: 
+   - vars/vcenter_vars.yml
+   - vcenter_secrets.yml
+  tasks:
+    - name: create marawan folder
+      community.vmware.vcenter_folder:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password:  "{{ vcenter_password }}"
+        validate_certs: "{{ validate_certs }}"
+        datacenter_name: "{{ datacenter_name }}"
+        folder_name: "{{ folder_name }}"
+        state: present
+      register: result
+
+    - name: Display creating folder results
+      debug:
+        var: result
+
+    - name: Find folder by name
+      vmware.vmware_rest.vcenter_folder_info:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ validate_certs }}"
+        names: "{{ folder_name }}"
+      register: folder_info
+
+    - name: print folder info that is retrieved
+      debug:
+        msg: "{{ folder_info }}"
+
+    - name: Gather information about datastores
+      vmware.vmware_rest.vcenter_datastore_info:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ validate_certs }}"
+        names: Pure-Datastore
+      register: datastore_info
+
+    - name: Display datastore information
+      debug:
+        var: datastore_info
+
+    - name: Create a content library based on a DataStore
+      vmware.vmware_rest.content_locallibrary:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ validate_certs }}"
+        name: template_content_library
+        description: here i will save the templates to be used by the aap
+        publish_info: 
+          published: true
+          authentication_method: NONE
+        storage_backings:
+          - datastore_id: "{{ datastore_info.value[0].datastore }}"
+            type: DATASTORE
+        state: present
+      register: temp_lib
+
+    - name: print content library info that is retrieved
+      debug:
+        var: temp_lib
+
+    - name: Build a list of all the clusters
+      vmware.vmware_rest.vcenter_cluster_info:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ validate_certs }}"
+      register: all_the_clusters
+
+    - name: Retrieve details about the first cluster
+      debug:
+        msg: "{{ all_the_clusters }}"  
+
+
+    - name: Get the existing resource pools
+      vmware.vmware_rest.vcenter_resourcepool_info:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ validate_certs }}"
+      register: resource_pools
+
+    - name: Get the dvswitch called VM Network
+      vmware.vmware_rest.vcenter_network_info:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ validate_certs }}"
+        names:  Public Network
+      register: my_networks
+
+    - name: Retrieve details about networks
+      debug:
+        msg: "{{ my_networks }}"
+
+    - name: Create a new VM from the OVF
+      vmware.vmware_rest.vcenter_ovf_libraryitem:
+        vcenter_hostname: "{{ vcenter_hostname }}"
+        vcenter_username: "{{ vcenter_username }}"
+        vcenter_password: "{{ vcenter_password }}"
+        vcenter_validate_certs: "{{ validate_certs }}"
+        ovf_library_item_id: 63665173-a697-40c1-8f78-e4c2c14e7282
+        state: deploy
+        session_timeout: 1500
+        target:
+          folder_id: "{{ folder_info.value[0].folder }}"
+          resource_pool_id: '{{ resource_pools.value[0].resource_pool }}'
+        deployment_spec:
+          name: ovf_to_vm_1500
+          accept_all_EULA: true
+          storage_provisioning: thin
+          network_mappings:
+              "VM Network": "{{ my_networks.value[0].network }}"
+
