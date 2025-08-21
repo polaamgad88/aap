@@ -1,0 +1,5 @@
+vcenter_hostname: prod-vcenter.linux-plus.local
+vcenter_username: administrator@vsphere.htest.local
+validate_certs: false
+datacenter_name: Datacenter
+folder_name: marawan_Adel_RHAAP_RHOCP
