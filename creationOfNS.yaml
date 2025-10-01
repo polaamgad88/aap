@@ -1,5 +1,5 @@
 ---
-- name: Login with username/password and create namespace
+- name: Login and create namespace (simple)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -8,78 +8,36 @@
     api_url: "https://api.ocp-uat.linux-plus.local:6443"
     ocp_username: "kubeadmin"
     ocp_password: "w6U5e-8aZQZ-eJLvE-DdEKj"
-    insecure_skip_tls_verify: true  # true == don't validate certs
-
-  vars_prompt:
-    - name: target_namespace
-      prompt: "Enter the namespace to create"
-      private: no
+    insecure_skip_tls_verify: true
 
   collections:
     - community.okd
     - kubernetes.core
 
   tasks:
-    - name: Normalize validate_certs
-      ansible.builtin.set_fact:
-        kube_validate_certs: "{{ not insecure_skip_tls_verify | bool }}"
+    - name: Authenticate to OpenShift
+      community.okd.openshift_auth:
+        host: "{{ api_url }}"
+        username: "{{ ocp_username }}"
+        password: "{{ ocp_password }}"
+        validate_certs: "{{ not (insecure_skip_tls_verify | bool) }}"
+      register: ocp_auth
 
-    - name: Try login using community.okd.openshift_auth (preferred)
-      block:
-        - name: Authenticate to OpenShift and get token
-          community.okd.openshift_auth:
-            host: "{{ api_url }}"
-            username: "{{ ocp_username }}"
-            password: "{{ ocp_password }}"
-            validate_certs: "{{ kube_validate_certs }}"
-          register: ocp_auth
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        host: "{{ api_url }}"
+        api_key: "{{ ocp_auth.openshift_auth.api_key }}"
+        validate_certs: "{{ not (insecure_skip_tls_verify | bool) }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "adel-ns-autpomation-vms"
 
-        - name: Create (or ensure) the namespace exists (token path)
-          kubernetes.core.k8s:
-            host: "{{ api_url }}"
-            api_key: "{{ ocp_auth.openshift_auth.api_key }}"
-            validate_certs: "{{ kube_validate_certs }}"
-            state: present
-            definition:
-              apiVersion: v1
-              kind: Namespace
-              metadata:
-                name: "{{ target_namespace }}"
-
-        - name: Log out (revoke the token)
-          community.okd.openshift_auth:
-            state: absent
-            host: "{{ api_url }}"
-            api_key: "{{ ocp_auth.openshift_auth.api_key }}"
-            validate_certs: "{{ kube_validate_certs }}"
-      rescue:
-        - name: Fallback — create a temp dir for kubeconfig
-          ansible.builtin.tempfile:
-            state: directory
-            suffix: oc_kube
-          register: tmpdir
-
-        - name: Fallback — login with oc to write kubeconfig
-          ansible.builtin.command: >
-            oc login {{ api_url }}
-            -u {{ ocp_username }}
-            -p {{ ocp_password }}
-            {{ '--insecure-skip-tls-verify=true' if not kube_validate_certs else '' }}
-            --kubeconfig {{ tmpdir.path }}/config
-          changed_when: "'Logged into' in login_out.stdout or 'Using project' in login_out.stdout"
-          register: login_out
-
-        - name: Create (or ensure) the namespace exists (kubeconfig path)
-          kubernetes.core.k8s:
-            kubeconfig: "{{ tmpdir.path }}/config"
-            state: present
-            definition:
-              apiVersion: v1
-              kind: Namespace
-              metadata:
-                name: "{{ target_namespace }}"
-
-        - name: Cleanup kubeconfig dir
-          ansible.builtin.file:
-            path: "{{ tmpdir.path }}"
-            state: absent
+    - name: Logout (revoke token)
+      community.okd.openshift_auth:
+        state: absent
+        host: "{{ api_url }}"
+        api_key: "{{ ocp_auth.openshift_auth.api_key }}"
+        validate_certs: "{{ not (insecure_skip_tls_verify | bool) }}"
