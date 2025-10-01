@@ -1,0 +1,22 @@
+---
+- name: Authenticate to OpenShift and persist API token
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    api_url: "https://api.ocp-uat.linux-plus.local:6443"
+    ocp_username: "kubeadmin"
+    ocp_password: "w6U5e-8aZQZ-eJLvE-DdEKj"
+    insecure_skip_tls_verify: true
+
+  tasks:
+    - name: Authenticate to OpenShift and get token
+      community.okd.openshift_auth:   # requires: ansible-galaxy collection install community.okd
+        host: "{{ api_url }}"
+        username: "{{ ocp_username }}"
+        password: "{{ ocp_password }}"
+        validate_certs: "{{ not insecure_skip_tls_verify }}"
+        state: present
+      register: auth
+      no_log: true   # hides creds and token in output
