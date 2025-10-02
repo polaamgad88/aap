@@ -1,0 +1,221 @@
+---
+- name: Enforce HTPasswd IdP (adel) + cluster-admin via ACM policy (no files)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    governance_namespace: governance
+    target_clusterset: set1
+
+  vars_prompt:
+    - name: adel_password
+      prompt: "Enter password for user 'adel'"
+      private: yes
+
+  collections:
+    - kubernetes.core
+    - community.general
+
+  tasks:
+    - name: Ensure governance namespace exists on HUB
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ governance_namespace }}"
+        state: present
+
+    - name: Create a temporary file to build htpasswd entry
+      ansible.builtin.tempfile:
+        state: file
+        prefix: htpasswd_
+      register: tmp_htp
+
+    - name: Generate htpasswd entry (bcrypt) for user 'adel'
+      community.general.htpasswd:
+        path: "{{ tmp_htp.path }}"
+        name: "adel"
+        password: "{{ adel_password }}"
+        crypt_scheme: "bcrypt"
+        state: present
+
+    - name: Read htpasswd line
+      ansible.builtin.slurp:
+        src: "{{ tmp_htp.path }}"
+      register: slurped
+
+    - name: Extract line as fact and remove temp file
+      block:
+        - ansible.builtin.set_fact:
+            htpasswd_line: "{{ (slurped.content | b64decode).splitlines() | first }}"
+      always:
+        - ansible.builtin.file:
+            path: "{{ tmp_htp.path }}"
+            state: absent
+
+    # --- Secret with the htpasswd content ---
+    - name: Ensure htpasswd Secret (openshift-config/htpasswd-secret)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: htpasswd-secret
+            namespace: openshift-config
+          type: Opaque
+          stringData:
+            htpasswd: |
+              {{ htpasswd_line }}
+
+    # --- OAuth IdP using that Secret ---
+    - name: Ensure OAuth uses HTPasswd IdP referencing htpasswd-secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: config.openshift.io/v1
+          kind: OAuth
+          metadata:
+            name: cluster
+          spec:
+            identityProviders:
+              - name: local-htpasswd
+                mappingMethod: claim
+                type: HTPasswd
+                htpasswd:
+                  fileData:
+                    name: htpasswd-secret
+
+    # --- ClusterRoleBinding for cluster-admin ---
+    - name: Grant cluster-admin to user 'adel'
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: cluster-admin-adel
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-admin
+          subjects:
+            - kind: User
+              apiGroup: rbac.authorization.k8s.io
+              name: adel
+
+    # --- Placement for ManagedClusterSet set1 (governance namespace) ---
+    - name: Ensure Placement (v1beta1) selecting ClusterSet set1
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cluster.open-cluster-management.io/v1beta1
+          kind: Placement
+          metadata:
+            name: placement-set1
+            namespace: "{{ governance_namespace }}"
+          spec:
+            clusterSets:
+              - "{{ target_clusterset }}"
+
+    # --- Policy that wraps Secret+OAuth+CRB as ConfigurationPolicies ---
+    - name: Ensure Policy object (references the 3 desired objects)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: policy.open-cluster-management.io/v1
+          kind: Policy
+          metadata:
+            name: policy-htpasswd-adel-clusteradmin
+            namespace: "{{ governance_namespace }}"
+          spec:
+            disabled: false
+            remediationAction: enforce
+            policy-templates:
+              - objectDefinition:
+                  apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  metadata:
+                    name: cfg-htpasswd-secret-and-oauth
+                  spec:
+                    remediationAction: enforce
+                    severity: high
+                    object-templates:
+                      - complianceType: musthave
+                        objectDefinition:
+                          apiVersion: v1
+                          kind: Secret
+                          metadata:
+                            name: htpasswd-secret
+                            namespace: openshift-config
+                          type: Opaque
+                          stringData:
+                            htpasswd: |
+                              {{ htpasswd_line }}
+                      - complianceType: musthave
+                        objectDefinition:
+                          apiVersion: config.openshift.io/v1
+                          kind: OAuth
+                          metadata:
+                            name: cluster
+                          spec:
+                            identityProviders:
+                              - name: local-htpasswd
+                                mappingMethod: claim
+                                type: HTPasswd
+                                htpasswd:
+                                  fileData:
+                                    name: htpasswd-secret
+              - objectDefinition:
+                  apiVersion: policy.open-cluster-management.io/v1
+                  kind: ConfigurationPolicy
+                  metadata:
+                    name: cfg-cluster-admin-adel
+                  spec:
+                    remediationAction: enforce
+                    severity: high
+                    object-templates:
+                      - complianceType: musthave
+                        objectDefinition:
+                          apiVersion: rbac.authorization.k8s.io/v1
+                          kind: ClusterRoleBinding
+                          metadata:
+                            name: cluster-admin-adel
+                          roleRef:
+                            apiGroup: rbac.authorization.k8s.io
+                            kind: ClusterRole
+                            name: cluster-admin
+                          subjects:
+                            - kind: User
+                              apiGroup: rbac.authorization.k8s.io
+                              name: adel
+
+    # --- Bind the Policy to the Placement ---
+    - name: Ensure PlacementBinding
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: policy.open-cluster-management.io/v1
+          kind: PlacementBinding
+          metadata:
+            name: bind-htpasswd-adel
+            namespace: "{{ governance_namespace }}"
+          placementRef:
+            apiGroup: cluster.open-cluster-management.io
+            kind: Placement
+            name: placement-set1
+          subjects:
+            - apiGroup: policy.open-cluster-management.io
+              kind: Policy
+              name: policy-htpasswd-adel-clusteradmin
+
+    # --- Optional: wait for OAuth rollout on the hub (sanity) ---
+    - name: Wait for oauth-openshift deployment to be available (hub)
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: openshift-authentication
+        name: oauth-openshift
+      register: oauth_dep
+      retries: 15
+      delay: 10
+      until: oauth_dep.resources | length > 0
