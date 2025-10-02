@@ -1,0 +1,208 @@
+---
+- name: Remove "adel-infra" label from infra* nodes across a ClusterSet
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # HUB (ACM)
+    api_url: "https://api.ocp-v.linux-plus.local:6443"
+    ocp_username: "adel"
+    ocp_password: "P@ssw0rd"
+    insecure_skip_tls_verify: true
+
+    # Target set and match/label
+    target_clusterset: "set1"
+    node_name_substring: "infra"     # node name contains this (case-insensitive)
+    label_key: "adel-infra"
+
+    # Workload objects created on each member
+    spoke_ns: "acm-node-labeler"
+    manifestwork_name: "remove-adel-infra-v1"
+    job_name: "remove-adel-infra"
+    cleanup_after_success: true
+
+    # Image with oc/kubectl
+    cli_image: "quay.io/openshift/origin-cli:latest"
+
+  tasks:
+    - name: Authenticate to hub
+      community.okd.openshift_auth:
+        host: "{{ api_url }}"
+        username: "{{ ocp_username }}"
+        password: "{{ ocp_password }}"
+        validate_certs: "{{ not insecure_skip_tls_verify }}"
+        state: present
+      register: auth
+      no_log: true
+
+    - name: Build k8s connection
+      set_fact:
+        k8s_host: "{{ api_url }}"
+        k8s_api_key: "{{ auth.k8s_auth.api_key | default(auth.api_key) }}"
+        k8s_validate: "{{ not insecure_skip_tls_verify }}"
+
+    - name: Get members of ClusterSet {{ target_clusterset }}
+      kubernetes.core.k8s_info:
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        label_selectors:
+          - "cluster.open-cluster-management.io/clusterset={{ target_clusterset }}"
+      register: mc_in_set
+
+    - name: Build members list
+      set_fact:
+        member_clusters: "{{ mc_in_set.resources | default([]) | map(attribute='metadata.name') | list }}"
+
+    - name: Assert members exist
+      assert:
+        that: member_clusters | length > 0
+        fail_msg: "No ManagedClusters found in ClusterSet {{ target_clusterset }}"
+
+    - name: Create ManifestWork on each member to remove label from infra* nodes (idempotent)
+      kubernetes.core.k8s:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        state: present
+        definition:
+          apiVersion: work.open-cluster-management.io/v1
+          kind: ManifestWork
+          metadata:
+            name: "{{ manifestwork_name }}"
+            namespace: "{{ item }}"     # hub namespace == managed cluster name
+          spec:
+            workload:
+              manifests:
+                - apiVersion: v1
+                  kind: Namespace
+                  metadata: { name: "{{ spoke_ns }}" }
+                - apiVersion: v1
+                  kind: ServiceAccount
+                  metadata: { name: labeler, namespace: "{{ spoke_ns }}" }
+                - apiVersion: rbac.authorization.k8s.io/v1
+                  kind: ClusterRole
+                  metadata: { name: node-labeler }
+                  rules:
+                    - apiGroups: [""]
+                      resources: ["nodes"]
+                      verbs: ["get","list","patch","update","watch","label"]
+                - apiVersion: rbac.authorization.k8s.io/v1
+                  kind: ClusterRoleBinding
+                  metadata: { name: node-labeler-binding }
+                  subjects:
+                    - kind: ServiceAccount
+                      name: labeler
+                      namespace: "{{ spoke_ns }}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: ClusterRole
+                    name: node-labeler
+                - apiVersion: v1
+                  kind: ConfigMap
+                  metadata: { name: labeler-script, namespace: "{{ spoke_ns }}" }
+                  data:
+                    run.sh: |
+                      #!/usr/bin/env bash
+                      set -euo pipefail
+                      echo "Searching for nodes with name containing '{{ node_name_substring }}' ..."
+                      nodes=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -i '{{ node_name_substring }}' || true)
+                      if [ -z "${nodes}" ]; then
+                        echo "No matching nodes. Nothing to do."
+                        exit 0
+                      fi
+                      rc=0
+                      for n in ${nodes}; do
+                        current=$(kubectl get node "$n" -o jsonpath="{.metadata.labels['{{ label_key }}']}" || true)
+                        if [ -n "${current}" ]; then
+                          echo "Removing label {{ label_key }} from ${n}"
+                          # 'label key-' removes the label; succeeds if present
+                          if ! kubectl label node "$n" "{{ label_key }}-"; then
+                            echo "WARN: failed to remove label from ${n}" >&2
+                            rc=1
+                          fi
+                        else
+                          echo "Label {{ label_key }} not present on ${n}; skipping"
+                        fi
+                      done
+                      exit ${rc}
+                - apiVersion: batch/v1
+                  kind: Job
+                  metadata:
+                    name: "{{ job_name }}"
+                    namespace: "{{ spoke_ns }}"
+                  spec:
+                    ttlSecondsAfterFinished: 600
+                    backoffLimit: 0
+                    template:
+                      spec:
+                        serviceAccountName: labeler
+                        restartPolicy: Never
+                        containers:
+                          - name: kubectl
+                            image: "{{ cli_image }}"
+                            imagePullPolicy: IfNotPresent
+                            command: ["/bin/bash","/script/run.sh"]
+                            volumeMounts:
+                              - name: script
+                                mountPath: /script
+                        volumes:
+                          - name: script
+                            configMap:
+                              name: labeler-script
+                              defaultMode: 0755
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Best-effort wait for Applied/Available (do not fail if slow/unreported)
+      kubernetes.core.k8s_info:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        api_version: work.open-cluster-management.io/v1
+        kind: ManifestWork
+        name: "{{ manifestwork_name }}"
+        namespace: "{{ item }}"
+      register: mw_status
+      until: >
+        (mw_status.resources|length) > 0 and
+        (
+          (mw_status.resources[0].status.conditions | default([]) | selectattr('type','equalto','Applied')   | selectattr('status','equalto','True') | list | length) > 0
+          and
+          (mw_status.resources[0].status.conditions | default([]) | selectattr('type','equalto','Available') | selectattr('status','equalto','True') | list | length) > 0
+        )
+      retries: 1
+      delay: 6
+      failed_when: false
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Optional cleanup (keep effect)
+      when: cleanup_after_success
+      kubernetes.core.k8s:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        state: absent
+        definition:
+          apiVersion: work.open-cluster-management.io/v1
+          kind: ManifestWork
+          metadata:
+            name: "{{ manifestwork_name }}"
+            namespace: "{{ item }}"
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Summary
+      debug:
+        msg:
+          clusterset: "{{ target_clusterset }}"
+          action: "removed label {{ label_key }} from nodes with name containing '{{ node_name_substring }}' (if present)"
+          note: "Clusters with no infra nodes or without the label are treated as success."
+
