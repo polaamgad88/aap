@@ -1,0 +1,155 @@
+---
+- name: Create a namespace on all clusters in an ACM ClusterSet
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    api_url: "https://api.ocp-v.linux-plus.local:6443"   # HUB (your ACM)
+    ocp_username: "adel"
+    ocp_password: "P@ssw0rd"
+    insecure_skip_tls_verify: true
+
+    # --- parameters ---
+    target_clusterset: "set1"
+    namespace_name: "testy-testy"
+
+  tasks:
+    - name: Authenticate to OpenShift and get token
+      community.okd.openshift_auth:
+        host: "{{ api_url }}"
+        username: "{{ ocp_username }}"
+        password: "{{ ocp_password }}"
+        validate_certs: "{{ not insecure_skip_tls_verify }}"
+        state: present
+      register: auth
+      no_log: true
+
+    - name: Build k8s connection params
+      ansible.builtin.set_fact:
+        k8s_host: "{{ api_url }}"
+        k8s_api_key: "{{ auth.k8s_auth.api_key | default(auth.api_key) }}"
+        k8s_validate: "{{ not insecure_skip_tls_verify }}"
+
+    # --- discover members of the target ClusterSet ---
+
+    - name: Get ManagedClusterSets (v1beta2)
+      kubernetes.core.k8s_info:
+        api_version: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSet
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+      register: mcs_v1b2
+      failed_when: false
+
+    - name: Fallback to v1beta1 if needed
+      kubernetes.core.k8s_info:
+        api_version: cluster.open-cluster-management.io/v1beta1
+        kind: ManagedClusterSet
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+      when: mcs_v1b2.failed or (mcs_v1b2.resources | default([]) | length == 0)
+      register: mcs_v1b1
+      failed_when: false
+
+    - name: Select ClusterSets list
+      ansible.builtin.set_fact:
+        clustersets: >-
+          {{
+            (mcs_v1b2.resources | default([]))
+            if not (mcs_v1b2.failed or (mcs_v1b2.resources | default([]) | length == 0))
+            else (mcs_v1b1.resources | default([]))
+          }}
+
+    - name: Ensure target ClusterSet exists
+      ansible.builtin.assert:
+        that:
+          - clustersets | selectattr('metadata.name','equalto',target_clusterset) | list | length > 0
+        fail_msg: "ClusterSet {{ target_clusterset }} not found on hub {{ api_url }}"
+
+    - name: Get ManagedClusters that belong to the target ClusterSet
+      kubernetes.core.k8s_info:
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        label_selectors:
+          - "cluster.open-cluster-management.io/clusterset={{ target_clusterset }}"
+      register: mc_in_set
+
+    - name: Build list of member cluster names
+      ansible.builtin.set_fact:
+        member_clusters: "{{ mc_in_set.resources | default([]) | map(attribute='metadata.name') | list }}"
+
+    - name: Fail if no members found
+      ansible.builtin.assert:
+        that:
+          - member_clusters | length > 0
+        fail_msg: "No ManagedClusters found in ClusterSet {{ target_clusterset }}"
+
+    - name: Show target clusters
+      ansible.builtin.debug:
+        msg:
+          clusterset: "{{ target_clusterset }}"
+          members: "{{ member_clusters }}"
+
+    # --- create ManifestWork per member to create the namespace ---
+
+    - name: Create/ensure namespace {{ namespace_name }} via ManifestWork on each member
+      kubernetes.core.k8s:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        state: present
+        definition:
+          apiVersion: work.open-cluster-management.io/v1
+          kind: ManifestWork
+          metadata:
+            # Name should be unique per member; keep it deterministic
+            name: "create-namespace-{{ namespace_name }}"
+            # IMPORTANT: ManifestWork is created in the hub namespace == managed cluster name
+            namespace: "{{ item }}"
+          spec:
+            workload:
+              manifests:
+                - apiVersion: v1
+                  kind: Namespace
+                  metadata:
+                    name: "{{ namespace_name }}"
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Wait until ManifestWork Applied/Available on each member
+      kubernetes.core.k8s_info:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        api_version: work.open-cluster-management.io/v1
+        kind: ManifestWork
+        name: "create-namespace-{{ namespace_name }}"
+        namespace: "{{ item }}"
+      register: mw_status
+      until: >
+        (mw_status.resources|length) > 0 and
+        (
+          (mw_status.resources[0].status.conditions | default([]) | selectattr('type','equalto','Applied') | selectattr('status','equalto','True') | list | length) > 0
+          and
+          (mw_status.resources[0].status.conditions | default([]) | selectattr('type','equalto','Available') | selectattr('status','equalto','True') | list | length) > 0
+        )
+      retries: 20
+      delay: 6
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          created_namespace: "{{ namespace_name }}"
+          clusterset: "{{ target_clusterset }}"
+          applied_to: "{{ member_clusters }}"
+
