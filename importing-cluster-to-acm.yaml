@@ -1,0 +1,247 @@
+---
+- name: Import a new cluster into ACM and add it to ClusterSet set1 (auto-import)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # HUB (ACM) access
+    hub_api_url: "https://api.ocp-v.linux-plus.local:6443"
+    hub_username: "adel"
+    hub_password: "P@ssw0rd"
+    hub_insecure_skip_tls_verify: true
+
+    # New (spoke) cluster access
+    new_cluster_name: "spoke-new"     # <-- set the desired ManagedCluster name
+    new_api_url: "https://api.<spoke-domain>:6443"   # <-- set
+    new_username: "kubeadmin"         # or another user with cluster-admin
+    new_password: "REPLACE_ME"        # <-- set
+    new_insecure_skip_tls_verify: true  # set false if you supply a CA below
+
+    # Optional: if you have the spoke's CA bundle (base64-encoded), set it and flip new_insecure_skip_tls_verify=false
+    new_ca_bundle_b64: ""
+
+    # Target ClusterSet
+    clusterset_name: "set1"
+
+    # Enable classic addons (works well on OpenShift spokes)
+    enable_addons: true
+
+    # Auto-import retry attempts by the hub
+    auto_import_retry: "5"
+
+    # Wait settings
+    join_wait_retries: 60
+    join_wait_delay: 10
+
+  collections:
+    - community.okd
+    - kubernetes.core
+
+  tasks:
+    - name: Authenticate to HUB (ACM)
+      community.okd.openshift_auth:
+        host: "{{ hub_api_url }}"
+        username: "{{ hub_username }}"
+        password: "{{ hub_password }}"
+        validate_certs: "{{ not hub_insecure_skip_tls_verify }}"
+        state: present
+      register: hub_auth
+      no_log: true
+
+    - name: Build HUB k8s connection params
+      set_fact:
+        hub_host: "{{ hub_api_url }}"
+        hub_api_key: "{{ hub_auth.k8s_auth.api_key | default(hub_auth.api_key) }}"
+        hub_validate: "{{ not hub_insecure_skip_tls_verify }}"
+
+    - name: Verify ClusterSet {{ clusterset_name }} exists on HUB
+      kubernetes.core.k8s_info:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        api_version: cluster.open-cluster-management.io/v1beta2
+        kind: ManagedClusterSet
+        name: "{{ clusterset_name }}"
+      register: _mcs
+      failed_when: _mcs.resources | length == 0
+
+    # ----------------------------------------------------------------------
+    # Acquire a token for the NEW cluster and synthesize kubeconfig for auto-import
+    # ----------------------------------------------------------------------
+    - name: Authenticate to NEW cluster to get a token
+      community.okd.openshift_auth:
+        host: "{{ new_api_url }}"
+        username: "{{ new_username }}"
+        password: "{{ new_password }}"
+        validate_certs: "{{ not new_insecure_skip_tls_verify }}"
+        state: present
+      register: new_auth
+      no_log: true
+
+    - name: Build kubeconfig for NEW cluster (auto-import)
+      set_fact:
+        new_kubeconfig: |-
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              {{ 'certificate-authority-data: ' ~ new_ca_bundle_b64 if (not new_insecure_skip_tls_verify and new_ca_bundle_b64|length>0) else 'insecure-skip-tls-verify: true' }}
+              server: "{{ new_api_url }}"
+            name: spoke
+          contexts:
+          - context:
+              cluster: spoke
+              user: spoke
+            name: default
+          current-context: default
+          users:
+          - name: spoke
+            user:
+              token: "{{ (new_auth.k8s_auth.api_key | default(new_auth.api_key)) }}"
+      no_log: true
+
+    # ----------------------------------------------------------------------
+    # Create/ensure ManagedCluster with clusterset label, and auto-import secret
+    # ----------------------------------------------------------------------
+    - name: Ensure namespace for ManagedCluster resources exists on HUB
+      kubernetes.core.k8s:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ new_cluster_name }}"
+
+    - name: Check if ManagedCluster already exists
+      kubernetes.core.k8s_info:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        name: "{{ new_cluster_name }}"
+      register: mc_exists
+
+    - name: Create or update ManagedCluster (accept client + clusterset label)
+      kubernetes.core.k8s:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        state: present
+        definition:
+          apiVersion: cluster.open-cluster-management.io/v1
+          kind: ManagedCluster
+          metadata:
+            name: "{{ new_cluster_name }}"
+            labels:
+              cluster.open-cluster-management.io/clusterset: "{{ clusterset_name }}"
+              vendor: OpenShift
+          spec:
+            hubAcceptsClient: true
+            managedClusterClientConfigs:
+              - url: "{{ new_api_url }}"
+      # If it already exists, this is a safe server-side apply/merge
+
+    - name: Optionally enable classic ACM addons (OpenShift spokes)
+      when: enable_addons
+      kubernetes.core.k8s:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        state: present
+        definition:
+          apiVersion: agent.open-cluster-management.io/v1
+          kind: KlusterletAddonConfig
+          metadata:
+            name: "{{ new_cluster_name }}"
+            namespace: "{{ new_cluster_name }}"
+          spec:
+            clusterName: "{{ new_cluster_name }}"
+            clusterNamespace: "{{ new_cluster_name }}"
+            applicationManager: { enabled: true }
+            policyController:   { enabled: true }
+            searchCollector:    { enabled: true }
+            certPolicyController: { enabled: true }
+            iamPolicyController:  { enabled: true }
+
+    - name: Create/refresh auto-import-secret on HUB (triggers auto-import)
+      kubernetes.core.k8s:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: auto-import-secret
+            namespace: "{{ new_cluster_name }}"
+          type: Opaque
+          stringData:
+            kubeconfig: "{{ new_kubeconfig }}"
+            autoImportRetry: "{{ auto_import_retry }}"
+      no_log: true
+
+    # ----------------------------------------------------------------------
+    # Wait until the new cluster is Joined and Available
+    # ----------------------------------------------------------------------
+    - name: Wait for ManagedCluster to Join and become Available
+      kubernetes.core.k8s_info:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        name: "{{ new_cluster_name }}"
+      register: mc_status
+      until: >
+        (mc_status.resources | length) > 0 and
+        (
+          (
+            mc_status.resources[0].status.conditions | default([]) |
+            selectattr('type','equalto','ManagedClusterJoined') |
+            selectattr('status','equalto','True') | list | length
+          ) > 0
+        ) and
+        (
+          (
+            mc_status.resources[0].status.conditions | default([]) |
+            selectattr('type','equalto','ManagedClusterConditionAvailable') |
+            selectattr('status','equalto','True') | list | length
+          ) > 0
+        )
+      retries: "{{ join_wait_retries }}"
+      delay: "{{ join_wait_delay }}"
+
+    - name: Confirm clusterset membership label
+      kubernetes.core.k8s_info:
+        host: "{{ hub_host }}"
+        api_key: "{{ hub_api_key }}"
+        validate_certs: "{{ hub_validate }}"
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        name: "{{ new_cluster_name }}"
+      register: mc_final
+
+    - name: Summary
+      debug:
+        msg:
+          managed_cluster: "{{ new_cluster_name }}"
+          api_url: "{{ new_api_url }}"
+          joined: >-
+            {{
+              mc_final.resources[0].status.conditions |
+              selectattr('type','equalto','ManagedClusterJoined') |
+              selectattr('status','equalto','True') | list | length > 0
+            }}
+          available: >-
+            {{
+              mc_final.resources[0].status.conditions |
+              selectattr('type','equalto','ManagedClusterConditionAvailable') |
+              selectattr('status','equalto','True') | list | length > 0
+            }}
+          clusterset: "{{ mc_final.resources[0].metadata.labels['cluster.open-cluster-management.io/clusterset'] | default('') }}"
