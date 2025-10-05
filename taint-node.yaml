@@ -1,0 +1,218 @@
+---
+- name: Taint "inf*" nodes across a ClusterSet via ACM (NoSchedule)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # HUB (ACM)
+    api_url: "https://api.ocp-v.linux-plus.local:6443"
+    ocp_username: "adel"
+    ocp_password: "P@ssw0rd"
+    insecure_skip_tls_verify: true
+
+    # Target ClusterSet and match
+    target_clusterset: "set1"
+    node_name_substring: "inf"        # case-insensitive match in node name
+
+    # Taint to apply => key[=value]:effect
+    taint_key: "inf1"
+    taint_value: ""                   # leave empty for key-only taint; set if you need a value
+    taint_effect: "NoSchedule"        # NoSchedule | PreferNoSchedule | NoExecute
+
+    # Workload executed on each member cluster
+    spoke_ns: "acm-node-labeler"
+    manifestwork_name: "taint-inf-nodes-v1"
+    job_name: "taint-inf-nodes"
+    cleanup_after_success: true       # remove the ManifestWork after applying taints
+
+    # Image with oc/kubectl
+    cli_image: "quay.io/openshift/origin-cli:latest"
+
+  tasks:
+    - name: Authenticate to hub
+      community.okd.openshift_auth:
+        host: "{{ api_url }}"
+        username: "{{ ocp_username }}"
+        password: "{{ ocp_password }}"
+        validate_certs: "{{ not insecure_skip_tls_verify }}"
+        state: present
+      register: auth
+      no_log: true
+
+    - name: Build k8s connection
+      set_fact:
+        k8s_host: "{{ api_url }}"
+        k8s_api_key: "{{ auth.k8s_auth.api_key | default(auth.api_key) }}"
+        k8s_validate: "{{ not insecure_skip_tls_verify }}"
+
+    - name: Get members of ClusterSet {{ target_clusterset }}
+      kubernetes.core.k8s_info:
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        label_selectors:
+          - "cluster.open-cluster-management.io/clusterset={{ target_clusterset }}"
+      register: mc_in_set
+
+    - name: Build members list
+      set_fact:
+        member_clusters: "{{ mc_in_set.resources | default([]) | map(attribute='metadata.name') | list }}"
+
+    - name: Assert members exist
+      assert:
+        that: member_clusters | length > 0
+        fail_msg: "No ManagedClusters found in ClusterSet {{ target_clusterset }}"
+
+    - name: Create ManifestWork to taint inf* nodes on each member (idempotent)
+      kubernetes.core.k8s:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        state: present
+        definition:
+          apiVersion: work.open-cluster-management.io/v1
+          kind: ManifestWork
+          metadata:
+            name: "{{ manifestwork_name }}"
+            namespace: "{{ item }}"    # hub namespace == managed cluster name
+          spec:
+            workload:
+              manifests:
+                - apiVersion: v1
+                  kind: Namespace
+                  metadata: { name: "{{ spoke_ns }}" }
+                - apiVersion: v1
+                  kind: ServiceAccount
+                  metadata: { name: labeler, namespace: "{{ spoke_ns }}" }
+                - apiVersion: rbac.authorization.k8s.io/v1
+                  kind: ClusterRole
+                  metadata: { name: node-tainter }
+                  rules:
+                    - apiGroups: [""]
+                      resources: ["nodes"]
+                      verbs: ["get","list","patch","update","watch"]
+                - apiVersion: rbac.authorization.k8s.io/v1
+                  kind: ClusterRoleBinding
+                  metadata: { name: node-tainter-binding }
+                  subjects:
+                    - kind: ServiceAccount
+                      name: labeler
+                      namespace: "{{ spoke_ns }}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: ClusterRole
+                    name: node-tainter
+                - apiVersion: v1
+                  kind: ConfigMap
+                  metadata: { name: taint-script, namespace: "{{ spoke_ns }}" }
+                  data:
+                    run.sh: |
+                      #!/usr/bin/env bash
+                      set -euo pipefail
+                      match='{{ node_name_substring }}'
+                      key='{{ taint_key }}'
+                      val='{{ taint_value }}'
+                      effect='{{ taint_effect }}'
+
+                      # Build taint spec: key[=value]:effect
+                      if [ -n "$val" ]; then
+                        taintSpec="${key}=${val}:${effect}"
+                      else
+                        taintSpec="${key}:${effect}"
+                      fi
+
+                      echo "Searching nodes with name containing '${match}' ..."
+                      nodes=$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -i "${match}" || true)
+                      if [ -z "${nodes}" ]; then
+                        echo "No matching nodes. Nothing to do."
+                        exit 0
+                      fi
+
+                      rc=0
+                      for n in ${nodes}; do
+                        echo "Applying taint '${taintSpec}' to node ${n}"
+                        if ! kubectl taint nodes "${n}" "${taintSpec}" --overwrite; then
+                          echo "WARN: failed to taint ${n}" >&2
+                          rc=1
+                        fi
+                      done
+                      exit ${rc}
+                - apiVersion: batch/v1
+                  kind: Job
+                  metadata:
+                    name: "{{ job_name }}"
+                    namespace: "{{ spoke_ns }}"
+                  spec:
+                    ttlSecondsAfterFinished: 600
+                    backoffLimit: 0
+                    template:
+                      spec:
+                        serviceAccountName: labeler
+                        restartPolicy: Never
+                        containers:
+                          - name: kubectl
+                            image: "{{ cli_image }}"
+                            imagePullPolicy: IfNotPresent
+                            command: ["/bin/bash","/script/run.sh"]
+                            volumeMounts:
+                              - name: script
+                                mountPath: /script
+                        volumes:
+                          - name: script
+                            configMap:
+                              name: taint-script
+                              defaultMode: 0755
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Best-effort wait for Applied/Available (don’t fail if slow/unreported)
+      kubernetes.core.k8s_info:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        api_version: work.open-cluster-management.io/v1
+        kind: ManifestWork
+        name: "{{ manifestwork_name }}"
+        namespace: "{{ item }}"
+      register: mw_status
+      until: >
+        (mw_status.resources|length) > 0 and
+        (
+          (mw_status.resources[0].status.conditions | default([]) | selectattr('type','equalto','Applied')   | selectattr('status','equalto','True') | list | length) > 0
+          and
+          (mw_status.resources[0].status.conditions | default([]) | selectattr('type','equalto','Available') | selectattr('status','equalto','True') | list | length) > 0
+        )
+      retries: 30
+      delay: 6
+      failed_when: false
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Optional cleanup (keep taints)
+      when: cleanup_after_success
+      kubernetes.core.k8s:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key }}"
+        validate_certs: "{{ k8s_validate }}"
+        state: absent
+        definition:
+          apiVersion: work.open-cluster-management.io/v1
+          kind: ManifestWork
+          metadata:
+            name: "{{ manifestwork_name }}"
+            namespace: "{{ item }}"
+      loop: "{{ member_clusters }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Summary
+      debug:
+        msg:
+          clusterset: "{{ target_clusterset }}"
+          taint_applied: "{{ taint_key }}{{ ('='+taint_value) if taint_value|length>0 else '' }}:{{ taint_effect }}"
+          note: "Pods must have matching tolerations to schedule onto these nodes."
