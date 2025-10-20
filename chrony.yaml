@@ -1,0 +1,78 @@
+---
+- name: Ensure public NTP servers are present in chrony.conf
+  hosts: all
+  gather_facts: false
+
+  vars:
+    # default public NTP servers (override in Job Template or Survey)
+    chrony_public_servers:
+      - "0.pool.ntp.org"
+      - "1.pool.ntp.org"
+
+    chrony_conf_path: /etc/chrony.conf
+    chrony_service_name: chronyd    # use 'chrony' on some distros - adjust if needed
+
+  become: true
+  become_method: sudo
+  # playbook runs as root (via become). Job template must supply a Machine credential
+  # which can sudo to root without a password.
+
+  tasks:
+    - name: Ensure chrony config directory exists (safety)
+      ansible.builtin.file:
+        path: "{{ chrony_conf_path | dirname }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Backup existing chrony.conf (timestamped)
+      ansible.builtin.copy:
+        src: "{{ chrony_conf_path }}"
+        dest: "{{ chrony_conf_path }}.bak_{{ lookup('pipe','date +%Y%m%dT%H%M%S') }}"
+        remote_src: true
+      when: ansible.builtin.stat(path=chrony_conf_path).stat.exists
+      ignore_errors: yes
+
+    - name: Read current chrony.conf into memory
+      ansible.builtin.slurp:
+        src: "{{ chrony_conf_path }}"
+      register: chrony_conf_raw
+      ignore_errors: true
+
+    - name: Decode chrony.conf content (set to empty if missing)
+      set_fact:
+        chrony_conf_content: "{{ (chrony_conf_raw.content | default('')) | b64decode | default('') }}"
+
+    - name: Ensure configured public servers exist as 'server' lines (idempotent)
+      vars:
+        server_line: "server {{ item }} iburst"
+        regexp_pattern: "^server\\s+{{ item | regex_escape() }}\\b"
+      ansible.builtin.lineinfile:
+        path: "{{ chrony_conf_path }}"
+        create: true
+        backup: true
+        regexp: "{{ regexp_pattern }}"
+        line: "{{ server_line }}"
+        insertafter: EOF
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ chrony_public_servers }}"
+      notify: restart chrony
+      register: chrony_changes
+
+    - name: Show which servers were ensured (for job output)
+      ansible.builtin.debug:
+        msg: "Ensured server line for {{ item.item }} changed={{ item.changed }}"
+      loop: "{{ chrony_changes.results | default([]) }}"
+      when: chrony_changes is defined
+
+  handlers:
+    - name: restart chrony
+      ansible.builtin.service:
+        name: "{{ chrony_service_name }}"
+        state: restarted
+        enabled: yes
+      become: true
+      become_user: root
