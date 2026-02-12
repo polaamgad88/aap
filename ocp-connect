@@ -1,0 +1,53 @@
+
+---
+- name: Simple OpenShift Connection Test
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # These variables are automatically injected by AAP OpenShift credentials
+    # or can be overridden in job template extra vars
+    ocp_api_url: "{{ lookup('env', 'K8S_AUTH_HOST') | default(k8s_auth_host | default('https://api.your-cluster.example.com:6443')) }}"
+    ocp_token: "{{ lookup('env', 'K8S_AUTH_API_KEY') | default(k8s_auth_api_key | default('YOUR_TOKEN_HERE')) }}"
+    
+  tasks:
+    - name: Test OpenShift cluster connectivity
+      uri:
+        url: "{{ ocp_api_url }}/healthz"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: false
+        status_code: 200
+      register: health_result
+      
+    - name: Get cluster version
+      uri:
+        url: "{{ ocp_api_url }}/apis/config.openshift.io/v1/clusterversions/version"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: false
+        return_content: yes
+      register: version_result
+      
+    - name: Display connection results
+      debug:
+        msg: |
+          ✅ OpenShift Connection Successful!
+          Cluster URL: {{ ocp_api_url }}
+          Health Status: {{ health_result.status | default('Not tested') }}
+          OpenShift Version: {{ version_result.json.status.desired.version | default('Unknown') }}
+          Cluster ID: {{ version_result.json.spec.clusterID | default('Unknown') }}
+      when: health_result is defined and version_result is defined
+      
+    - name: Display test info (when using defaults)
+      debug:
+        msg: |
+          ⚠️  Using default values - provide real cluster details to test connection:
+          Cluster URL: {{ ocp_api_url }}
+          Token: {{ ocp_token[:20] }}... (truncated)
+          
+          To test with real values, run:
+          ansible-playbook -i inventory.yml simple-ocp-connect.yml -e "cluster_api_url=https://your-cluster:6443" -e "cluster_token=your-token"
+      when: health_result is not defined or version_result is not defined
