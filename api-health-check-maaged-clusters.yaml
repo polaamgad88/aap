@@ -1,0 +1,100 @@
+---
+- name: Hub ACM - List managed clusters then check each API /healthz
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # Hub (ACM) cluster API + token
+    ocp_api_url: "https://api.bmocp.lp.local:6443"
+    ocp_token: "sha256~REPLACE_ME"
+
+    # TLS validation
+    validate_certs: false
+
+  tasks:
+    # --- Existing hub checks ---
+    - name: Check HUB API health
+      ansible.builtin.uri:
+        url: "{{ ocp_api_url }}/healthz"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+      register: hub_health
+
+    - name: Get HUB cluster version
+      ansible.builtin.uri:
+        url: "{{ ocp_api_url }}/apis/config.openshift.io/v1/clusterversions/version"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: yes
+      register: hub_version
+
+    - name: Show HUB result
+      ansible.builtin.debug:
+        msg:
+          - "HUB API Health Status: {{ hub_health.status }}"
+          - "HUB OpenShift Version: {{ hub_version.json.status.desired.version | default('N/A') }}"
+
+    # --- ACM: list managed clusters on the HUB ---
+    - name: Get ACM ManagedClusters list (from hub)
+      ansible.builtin.uri:
+        url: "{{ ocp_api_url }}/apis/cluster.open-cluster-management.io/v1/managedclusters"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: yes
+        status_code: 200
+      register: managedclusters
+
+    - name: Build list of managed cluster API endpoints
+      ansible.builtin.set_fact:
+        acm_clusters: >-
+          {{
+            (acm_clusters | default([])) + [{
+              'name': item.metadata.name,
+              'api': (item.spec.managedClusterClientConfigs[0].url
+                      if (item.spec.managedClusterClientConfigs is defined and item.spec.managedClusterClientConfigs|length > 0)
+                      else None)
+            }]
+          }}
+      loop: "{{ managedclusters.json.items | default([]) }}"
+
+    - name: Keep only clusters that have an API URL
+      ansible.builtin.set_fact:
+        acm_clusters: "{{ acm_clusters | selectattr('api','ne',None) | list }}"
+
+    - name: Show discovered clusters (name + api)
+      ansible.builtin.debug:
+        var: acm_clusters
+
+    # --- Health check each managed cluster API ---
+    # NOTE: This tries WITHOUT auth. If your /healthz needs auth, see note below.
+    - name: Check each managed cluster API /healthz
+      ansible.builtin.uri:
+        url: "{{ item.api }}/healthz"
+        method: GET
+        validate_certs: "{{ validate_certs }}"
+        status_code: [200, 401, 403]
+        return_content: yes
+      loop: "{{ acm_clusters }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.api }}"
+      register: mc_health
+      failed_when: false
+
+    - name: Summarize managed cluster health results
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            mc_health.results
+            | map(attribute='item')
+            | zip(mc_health.results | map(attribute='status'))
+            | map('list')
+            | map('join', ' : ')
+            | list
+          }}
