@@ -3,11 +3,17 @@
   hosts: localhost
   gather_facts: false
 
-  vars:
-    hub_api_url: "https://api.bmocp.lp.local:6443"
-    hub_token: "{{ lookup('env','HUB_TOKEN') }}"
-    validate_certs: false
+  # vars:
+  #   hub_api_url: "https://api.bmocp.lp.local:6443"
+  #   hub_token: "{{ lookup('env','HUB_TOKEN') }}"
+  #   validate_certs: false
 
+
+  
+  vars:
+    hub_api_url: "{{ lookup('env','K8S_AUTH_HOST') | default('https://api.bmocp.lp.local:6443') }}"
+    hub_token: "{{ lookup('env','K8S_AUTH_API_KEY') }}"
+    validate_certs: false
     # Public sources (no auth required typically)
     rh_release_notes_base: "https://docs.redhat.com/en/documentation/openshift_container_platform"
     rh_security_api_base: "https://access.redhat.com/hydra/rest/securitydata"
