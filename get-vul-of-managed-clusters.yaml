@@ -1,0 +1,275 @@
+---
+- name: OpenShift Cluster Security Summary for ACM managed clusters
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    hub_api_url: "https://api.bmocp.lp.local:6443"
+    hub_token: "{{ lookup('env','HUB_TOKEN') }}"
+    validate_certs: false
+
+    # Public sources (no auth required typically)
+    rh_release_notes_base: "https://docs.redhat.com/en/documentation/openshift_container_platform"
+    rh_security_api_base: "https://access.redhat.com/hydra/rest/securitydata"
+
+  tasks:
+    - name: Get ACM ManagedClusters
+      ansible.builtin.uri:
+        url: "{{ hub_api_url }}/apis/cluster.open-cluster-management.io/v1/managedclusters"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ hub_token }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: yes
+        status_code: 200
+      register: managedclusters
+
+    - name: Build managed cluster names
+      ansible.builtin.set_fact:
+        mc_names: "{{ managedclusters.json['items'] | map(attribute='metadata.name') | list }}"
+
+    # Try to find per-cluster kubeconfig in each managed cluster namespace (namespace usually == managed cluster name)
+    - name: List secrets in each managed cluster namespace
+      ansible.builtin.uri:
+        url: "{{ hub_api_url }}/api/v1/namespaces/{{ item }}/secrets"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ hub_token }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: yes
+        status_code: [200, 403, 404]
+      loop: "{{ mc_names }}"
+      register: ns_secrets
+      failed_when: false
+
+    - name: Extract kubeconfig secret (first secret that contains data.kubeconfig)
+      ansible.builtin.set_fact:
+        mc_kubeconfigs: >-
+          {{
+            (mc_kubeconfigs | default({})) | combine({
+              item.item: (
+                (
+                  (item.json['items'] | default([]))
+                  | selectattr('data.kubeconfig','defined')
+                  | list
+                )[0].data.kubeconfig
+                if (
+                  item.json is defined and
+                  (item.json['items'] | default([]) | selectattr('data.kubeconfig','defined') | list | length) > 0
+                )
+                else None
+              )
+            })
+          }}
+      loop: "{{ ns_secrets.results }}"
+
+    - name: Build target clusters list with kubeconfig present
+      ansible.builtin.set_fact:
+        target_clusters: >-
+          {{
+            mc_kubeconfigs
+            | dict2items
+            | selectattr('value','ne',None)
+            | list
+          }}
+
+    - name: Warn clusters without kubeconfig (will be skipped)
+      ansible.builtin.debug:
+        msg: "Skipping (no kubeconfig found in hub namespace): {{ item }}"
+      loop: "{{ mc_names | difference(target_clusters | map(attribute='key') | list) }}"
+
+    # Decode kubeconfig and parse server + token/certs (no kubernetes modules, pure parsing)
+    - name: Decode kubeconfig for each target cluster
+      ansible.builtin.set_fact:
+        decoded_kubeconfigs: >-
+          {{
+            (decoded_kubeconfigs | default({})) | combine({
+              item.key: (item.value | b64decode)
+            })
+          }}
+      loop: "{{ target_clusters }}"
+
+    - name: Parse per-cluster api_url and bearer token from kubeconfig (best-effort)
+      ansible.builtin.set_fact:
+        cluster_access: >-
+          {{
+            (cluster_access | default([])) + [{
+              'name': item.key,
+              'kubeconfig_yaml': decoded_kubeconfigs[item.key] | from_yaml
+            }]
+          }}
+      loop: "{{ target_clusters }}"
+
+    - name: Normalize access fields (server + token)
+      ansible.builtin.set_fact:
+        cluster_access: >-
+          {{
+            cluster_access | map('combine', {
+              'api_url': (item.kubeconfig_yaml.clusters[0].cluster.server | default(None)),
+              'token': (
+                item.kubeconfig_yaml.users[0].user.token
+                | default(None)
+              )
+            }) | list
+          }}
+      vars:
+        item: "{{ item }}"
+      loop: "{{ cluster_access }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Get ClusterVersion from each managed cluster
+      ansible.builtin.uri:
+        url: "{{ item.api_url }}/apis/config.openshift.io/v1/clusterversions/version"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ item.token }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: yes
+        status_code: 200
+      loop: "{{ cluster_access }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: cv_results
+      failed_when: false
+
+    - name: Build cluster summary base (id/url/channel/version/image/updates)
+      ansible.builtin.set_fact:
+        summaries: >-
+          {{
+            (summaries | default([])) + [{
+              'name': item.item.name,
+              'api_url': item.item.api_url,
+              'cluster_id': (item.json.status.clusterID | default(item.json.spec.clusterID | default('N/A'))),
+              'channel': (item.json.spec.channel | default('N/A')),
+              'current_version': (item.json.status.desired.version | default('N/A')),
+              'release_image': (item.json.status.desired.image | default('N/A')),
+              'available_updates': (item.json.status.availableUpdates | default([]))
+            }]
+          }}
+      loop: "{{ cv_results.results }}"
+      when: item.status == 200
+
+    # Map current version -> advisory by scraping the 4.<minor> release notes page (contains RHSA per z-stream entry)
+    - name: Fetch release notes page for each minor (unique)
+      ansible.builtin.uri:
+        url: "{{ rh_release_notes_base }}/{{ item }}/html/release_notes/ocp-{{ item | regex_replace('\\.','-') }}-release-notes"
+        method: GET
+        validate_certs: true
+        return_content: yes
+        status_code: 200
+      loop: "{{ summaries | map(attribute='current_version') | map('regex_search','^(\\d+\\.\\d+)') | unique | list }}"
+      register: relnotes
+      failed_when: false
+
+    - name: Attach advisory ID for current version (regex against release notes HTML)
+      ansible.builtin.set_fact:
+        summaries: >-
+          {{
+            summaries | map('combine', {
+              'advisory_id': (
+                (
+                  (relnotes.results
+                    | selectattr('item','equalto', (item.current_version | regex_search('^(\\d+\\.\\d+)')))
+                    | list
+                  )[0].content
+                  | regex_search('RHSA-\\d{4}:\\d+[^\\n]*' ~ (item.current_version | regex_escape), multiline=True)
+                  | regex_search('RHSA-\\d{4}:\\d+')
+                )
+                | default('N/A')
+              )
+            }) | list
+          }}
+      vars:
+        item: "{{ item }}"
+      loop: "{{ summaries }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Pull CVEs for advisory from Red Hat Security Data API via CSAF JSON
+    - name: Get CSAF JSON for advisory (to list CVEs)
+      ansible.builtin.uri:
+        url: "{{ rh_security_api_base }}/csaf/{{ item.advisory_id }}.json"
+        method: GET
+        validate_certs: true
+        return_content: yes
+        status_code: [200, 404]
+      loop: "{{ summaries }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.advisory_id }}"
+      register: csaf
+      failed_when: false
+      when: item.advisory_id != 'N/A'
+
+    - name: Attach CVEs list from CSAF (cve + severity)
+      ansible.builtin.set_fact:
+        summaries: >-
+          {{
+            summaries | map('combine', {
+              'cves': (
+                (
+                  (csaf.results | selectattr('item.name','equalto', item.name) | list)[0].json.vulnerabilities
+                  | default([])
+                )
+                | map('extract', {'cve':'cve'})
+                | list
+              )
+            }) | list
+          }}
+      vars:
+        item: "{{ item }}"
+      loop: "{{ summaries }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Print in your requested style
+    - name: Print cluster security summary
+      ansible.builtin.debug:
+        msg:
+          - "OpenShift Cluster Security Summary"
+          - "=================================="
+          - ""
+          - "Cluster identification"
+          - "----------------------"
+          - "Cluster Name      : {{ item.name }}"
+          - "Cluster ID        : {{ item.cluster_id }}"
+          - "API URL           : {{ item.api_url }}"
+          - "Channel           : {{ item.channel }}"
+          - "Current Version   : {{ item.current_version }}"
+          - "Release Image     : {{ item.release_image }}"
+          - ""
+          - "Current advisory"
+          - "----------------"
+          - "Advisory ID       : {{ item.advisory_id }}"
+          - "Advisory URL      : {{ 'https://access.redhat.com/errata/' ~ (item.advisory_id | regex_replace(':','%3A')) if item.advisory_id != 'N/A' else 'N/A' }}"
+          - ""
+          - "Available updates (from ClusterVersion.status.availableUpdates)"
+          - "----------------------------------------------------------------"
+          - >-
+            {{
+              (item.available_updates | default([]))
+              | map('combine', {})
+              | map(attribute='version')
+              | list
+              | ternary('', '')
+            }}
+          - >-
+            {{
+              (item.available_updates | default([]))
+              | map('regex_replace', '^(.*)$', '- \\1')
+              | list
+            }}
+          - ""
+          - "CVEs for current advisory"
+          - "-------------------------"
+          - >-
+            {{
+              (item.cves | default([]) | length > 0)
+              | ternary(
+                  (item.cves | map('regex_replace', '^(CVE-\\d{4}-\\d+)$', '- \\1 | details=https://access.redhat.com/hydra/rest/securitydata/cve/\\1.json') | list),
+                  ['- N/A']
+                )
+            }}
+      loop: "{{ summaries }}"
+      loop_control:
+        label: "{{ item.name }}"
