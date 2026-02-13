@@ -3,10 +3,18 @@
   hosts: localhost
   gather_facts: false
 
+  # vars:
+  #   # Hub (ACM) cluster API + token
+  #   ocp_api_url: "https://api.bmocp.lp.local:6443"
+  #   ocp_token: "sha256~REPLACE_ME"
+
+
   vars:
-    # Hub (ACM) cluster API + token
     ocp_api_url: "https://api.bmocp.lp.local:6443"
-    ocp_token: "sha256~REPLACE_ME"
+    ocp_token: "sha256~cC8nECh4-ZhHIXyV9xAWgKRePc1aD4JhNeVi4ksDjSs"
+    validate_certs: false
+
+
 
     # TLS validation
     validate_certs: false
