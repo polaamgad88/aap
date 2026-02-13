@@ -1,0 +1,35 @@
+---
+- name: OpenShift API Test (Real Cluster)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    ocp_api_url: "https://api.bmocp.lp.local:6443"
+    ocp_token: "sha256~wHFNZFeFV9GWhI7uwzeLhad1VeOyw-75_VAaaMEKpkE"
+
+  tasks:
+    - name: Check API health
+      ansible.builtin.uri:
+        url: "{{ ocp_api_url }}/healthz"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: false
+        status_code: 200
+      register: health
+
+    - name: Get cluster version
+      ansible.builtin.uri:
+        url: "{{ ocp_api_url }}/apis/config.openshift.io/v1/clusterversions/version"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: false
+        return_content: yes
+      register: version
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg:
+          - "API Health Status: {{ health.status }}"
+          - "OpenShift Version: {{ version.json.status.desired.version }}"
