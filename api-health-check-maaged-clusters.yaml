@@ -70,7 +70,8 @@
                       else None)
             }]
           }}
-      loop: "{{ managedclusters.json.items | default([]) }}"
+      # loop: "{{ managedclusters.json.items | default([]) }}"
+      loop: "{{ managedclusters.json['items'] | default([]) }}"
 
     - name: Keep only clusters that have an API URL
       ansible.builtin.set_fact:
