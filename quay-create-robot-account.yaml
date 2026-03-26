@@ -1,0 +1,28 @@
+---
+- name: Create Quay Robot Account
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - infra.quay_configuration
+  vars:
+    namespace_name: ""
+    env_name: ""
+
+  tasks:
+    - name: Process namespace name to generate org_name
+      set_fact:
+        org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}"
+
+    - name: Configure Quay
+      quay_robot:
+        # name: "{{ org_name }}+{{ robot }}"
+        name: "{{ org_name }}+deployer_quay"
+        description: Robot Account
+        state: present
+        quay_host: https://quay.apps.paashub.aramco.com.sa
+        quay_token: "{{ quay_token }}"
+        validate_certs: false
+      register: robot_details
+
+    - ansible.builtin.debug:
+        msg: "ROBOT TOKEN: {{ robot_details['token'] }}"
