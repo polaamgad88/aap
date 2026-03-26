@@ -1,0 +1,25 @@
+---
+- name: Set Permission of Robot Account on organization
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - infra.quay_configuration
+  vars:
+    namespace_name: ""
+    env_name: ""
+
+  tasks:
+    - name: Process namespace name to generate org_name
+      set_fact:
+        org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}"
+
+    - name: Configure Quay
+      quay_default_perm:
+        organization: "{{ org_name }}"
+        name: devops
+        state: present
+        type: team
+        role: read
+        quay_host: https://quay.apps.paashub.aramco.com.sa
+        quay_token: "{{ quay_token }}"
+        validate_certs: false
