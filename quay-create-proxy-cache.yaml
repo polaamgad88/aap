@@ -1,0 +1,36 @@
+---
+- name: Create Quay Organization
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - infra.quay_configuration
+  vars:
+    namespace_name: ""
+    env_name: ""
+    upstream_username: ""
+    upstream_registry: ""
+    upstream_password: ""
+
+  tasks:
+    - name: Execute Proxy Cache Logic
+      block:
+        - name: Process namespace name to generate org_name
+          set_fact:
+            org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}"
+
+        - name: Ensure Proxy Cache is enabled in Organization
+          quay_proxy_cache:
+            organization: "{{ org_name }}"
+            username: "{{ upstream_username }}"
+            password: "{{ upstream_password }}"
+            expiration: 48h
+            state: present
+            registry: "{{ upstream_registry }}"
+            quay_host: https://quay.apps.paashub.aramco.com.sa
+            quay_token: "{{ quay_token }}"
+            validate_certs: false
+          register: output
+
+      when:
+        - upstream_registry is defined
+        - upstream_registry | length > 0
