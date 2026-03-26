@@ -1,0 +1,43 @@
+---
+- name: Create Quay Storage Quota
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - infra.quay_configuration
+  vars:
+    namespace_name: ""
+    env_name: ""
+
+  tasks:
+    - name: Process namespace name to generate org_name
+      set_fact:
+        org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}"
+
+    - name: Configure Quay (Dev/QA Environment)
+      quay_quota:
+        organization: "{{ org_name }}"
+        quota: 50 GiB
+        warning_pct: 80
+        reject_pct: 100
+        state: present
+        quay_host: https://quay.apps.paashub.aramco.com.sa
+        quay_token: "{{ quay_token }}"
+        validate_certs: false
+      register: output
+      when: env_name == "dev" or env_name == "qa"
+
+    - name: Configure Quay (Production Environment)
+      quay_quota:
+        organization: "{{ org_name }}"
+        quota: 70 GiB
+        warning_pct: 80
+        reject_pct: 100
+        state: present
+        quay_host: https://quay.apps.paashub.aramco.com.sa
+        quay_token: "{{ quay_token }}"
+        validate_certs: false
+      register: output
+      when: env_name == "prod"
+
+    - ansible.builtin.debug:
+        msg: "{{ output }}"
