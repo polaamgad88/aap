@@ -1,0 +1,28 @@
+---
+- name: Add DevOps team to Organization
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - infra.quay_configuration
+  vars:
+    namespace_name: ""
+    env_name: ""
+
+  tasks:
+    - name: Process namespace name to generate org_name
+      set_fact:
+        org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}"
+
+    - name: team operators inside the organization
+      quay_team:
+        name: devops
+        organization: "{{ org_name }}"
+        description: DevOps Team Responsible for CI/CD pipelines (creator)
+        role: creator
+        members:
+          - "devops"
+        state: present
+        append: false
+        quay_host: https://quay.apps.paashub.aramco.com.sa
+        quay_token: "{{ quay_token }}"
+        validate_certs: false
