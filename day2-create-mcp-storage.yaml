@@ -1,0 +1,67 @@
+---
+- name: Create MCP Storage
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+
+    - name: Whitelist
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: MachineConfigPool
+          metadata:
+            name: storage
+          spec:
+            nodeSelector:
+              matchLabels:
+                node-role.kubernetes.io/storage: ""
+            machineConfigSelector:
+              matchExpressions:
+                - operator: In
+                  key: machineconfiguration.openshift.io/role
+                  values:
+                    - worker
+                    - infra
+
+    # - name: Whitelist
+    #   kubernetes.core.k8s:
+    #     state: present
+    #     kubeconfig: "/tmp/kubeconfig"
+    #     validate_certs: "{{ validate_certs }}"
+    #     definition:
+    #       apiVersion: machineconfiguration.openshift.io/v1
+    #       kind: MachineConfigPool
+    #       metadata:
+    #         name: infra
+    #       spec:
+    #         nodeSelector:
+    #           matchLabels:
+    #             node-role.kubernetes.io/infra: ""
+    #         machineConfigSelector:
+    #           matchExpressions:
+    #             - operator: In
+    #               key: machineconfiguration.openshift.io/role
+    #               values: [worker, infra]

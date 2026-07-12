@@ -1,0 +1,100 @@
+---
+- name: OpenShift backup yaml files
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+    - community.general
+    - amazon.aws
+  vars:
+    cluster_id: "ibmdev"
+    cluster_api: "https://api.{{ cluster_id }}.aramco.com.sa:6443"
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+    aws_access_key: "eyOXL3cujLrrkC3SxiHI"
+    aws_secret_key: "868EqzFXUYhAA/sPHrtZHho+WvCsGaeTs4QHS4cO"
+    s3_endpoint_url: "https://s3.openshift-storage.svc:443"
+    s3_buket: "paashub-must-gather-vault-6774d623-c0b6-46dc-aa0b-5f14cd6f16b4"
+    namespace_name: "aramco-opsinsight"
+    backup_time: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+    backup_dir: "/tmp/{{ cluster_id }}/{{ namespace_name }}"
+    backup_archive: "/tmp/{{ cluster_id }}/{{ namespace_name }}.tar.gz"
+    s3_object_name: "{{ cluster_id }}/{{ namespace_name }}.tar.gz"
+    backup_parent_dir: "/tmp/{{ cluster_id }}"
+
+    s3_folder: "{{ cluster_id }}/{{ namespace_name }}"
+
+  tasks:
+
+    - name: Create Backup Directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+
+
+    - name: Set cluster_api based on cluster_id
+      set_fact:
+        cluster_api: |
+          {% if cluster_id == 'ibmdev' %}
+          https://api.{{ cluster_id }}.aramco.com:6443
+          {% else %}
+          https://api.{{ cluster_id }}.aramco.com.sa:6443
+          {% endif %}
+    - name: Login to paashub
+      command: >
+        oc login {{ cluster_api }} -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      register: cluster_token
+      failed_when: false
+      no_log: true
+      changed_when: false
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+    - name: set token cleaner
+      ansible.builtin.set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+
+
+
+    - name: Backup namespace resouces
+      shell: |
+        oc get namespace {{ namespace_name }} -o yaml > {{ backup_dir }}/00-namespace.yaml
+      changed_when: false
+
+    - name: Backup resoucres to yaml files
+      shell: |
+        oc get all,configmap,secret,serviceaccount,persistentvolumeclaims,service,route,ingress,deployment,deploymentconfig,statefulset,daemonset,job,cronjob,networkpolicy,role,rolebinding,resourcequota,limitrange -n {{ namespace_name }} -o yaml > {{ backup_dir }}/all-resoucres.yaml
+      changed_when: false
+
+
+
+    - name: Test upload to s3
+      amazon.aws.s3_object:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        endpoint_url: "{{ s3_endpoint_url }}"
+        bucket: "{{ s3_buket }}"
+        object: "{{ s3_folder }}/00-namespace.yaml"
+        src: "{{ backup_dir }}/00-namespace.yaml"
+        mode: put
+        validate_certs: false
+
+
+
+    - name: Test upload to s3
+      amazon.aws.s3_object:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        endpoint_url: "{{ s3_endpoint_url }}"
+        bucket: "{{ s3_buket }}"
+        object: "{{ s3_folder }}/all-resoucres.yaml"
+        src: "{{ backup_dir }}/all-resoucres.yaml"
+        mode: put
+        validate_certs: false
+      register: uploadd
+

@@ -1,0 +1,130 @@
+---
+- name: Create ODF Storage Cluster with Tolerations
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    validate_certs: false
+    kubeconfig_b64: ""
+    kubeconfig_path: "/tmp/kubeconfig"
+    odf_namespace: openshift-storage
+    storagecluster_name: ocs-storagecluster
+  tasks:
+    - name: Fail if kubeconfig is empty
+      fail:
+        msg: "EMPTY KUBECONFIG"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+
+    - name: Create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "{{ kubeconfig_path }}"
+        mode: "0600"
+
+    - name: Create ODF StorageCluster
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: ocs.openshift.io/v1
+          kind: StorageCluster
+          metadata:
+            annotations:
+              cluster.ocs.openshift.io/local-devices: 'true'
+              uninstall.ocs.openshift.io/cleanup-policy: delete
+              uninstall.ocs.openshift.io/mode: graceful
+            name: ocs-storagecluster
+            namespace: openshift-storage
+          spec:
+            storageDeviceSets:
+              - config: {}
+                count: 3
+                dataPVCTemplate:
+                  metadata: {}
+                  spec:
+                    accessModes:
+                      - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 1Gi
+                    storageClassName: lvm
+                    volumeMode: Block
+                  status: {}
+                name: ocs-deviceset-lvm
+                placement:
+                  nodeSelector: {}
+                  tolerations:
+                    - effect: NoSchedule
+                      key: node-role.kubernetes.io/master
+                      operator: Exists
+                    - effect: NoSchedule
+                      key: node-role.kubernetes.io/infra
+                      operator: Exists
+                preparePlacement:
+                  nodeSelector: {}
+                  tolerations:
+                    - effect: NoSchedule
+                      key: node-role.kubernetes.io/master
+                      operator: Exists
+                    - effect: NoSchedule
+                      key: node-role.kubernetes.io/infra
+                      operator: Exists
+                replica: 1
+                resources: {}
+            encryption:
+              keyRotation:
+                schedule: '@weekly'
+              kms: {}
+            monDataDirHostPath: /var/lib/rook
+            managedResources:
+              cephObjectStoreUsers: {}
+              cephCluster: {}
+              cephBlockPools:
+                defaultStorageClass: true
+              cephNonResilientPools: {}
+              cephObjectStores: {}
+              cephFilesystems: {}
+              cephRBDMirror: {}
+              cephToolbox: {}
+              cephDashboard: {}
+              cephConfig: {}
+              arbiter: {}
+            network:
+              connections:
+                encryption: {}
+              multiClusterService: {}
+              nodeTopologies: {}
+            externalStorage: {}
+            resourceProfile: balanced
+            flexibleScaling: true
+            enableCephTools: true
+            tolerations:
+              - effect: NoSchedule
+                key: node-role.kubernetes.io/master
+                operator: Exists
+              - effect: NoSchedule
+                key: node-role.kubernetes.io/infra
+                operator: Exists
+
+    # - name: Wait for StorageCluster to be Ready
+    #   pause:
+    #     minutes: 5
+
+    # - name: Check StorageCluster Status
+    #   kubernetes.core.k8s_info:
+    #     kubeconfig: "{{ kubeconfig_path }}"
+    #     validate_certs: "{{ validate_certs }}"
+    #     api_version: ocs.openshift.io/v1
+    #     kind: StorageCluster
+    #     name: "{{ storagecluster_name }}"
+    #     namespace: "{{ odf_namespace }}"
+    #   register: storagecluster_status
+
+    # - name: Fail if StorageCluster is not Ready
+    #   fail:
+    #     msg: "StorageCluster is not in Ready phase"
+    #   when: storagecluster_status.resources | length > 0 | bool and storagecluster_status.resources[0].status.phase != "Ready"

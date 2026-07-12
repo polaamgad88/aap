@@ -1,0 +1,72 @@
+---
+- name: Apply MachineConfig for Storage HDD to SSd
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    validate_certs: false
+    kubeconfig_b64: "" # <-- Pass this via CLI -e or vault
+    storage_mcp_name: worker
+    udev_rule: 'ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="sdb", ATTR{queue/rotational}="0"'
+    mc_name: "99-storage-ssd-udev"
+
+  tasks:
+    - name: Create kubeconfig file
+      ansible.builtin.copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+      when: kubeconfig_b64 is defined and kubeconfig_b64 | trim != ""
+    - name: Set raw rule with exact spacing and trailing newline
+      ansible.builtin.set_fact:
+        raw_udev_rule: |
+          ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="sdb",  ATTR{queue/rotational}="0"
+
+    - name: Encode to Base64 
+      ansible.builtin.set_fact:
+        udev_rule_b64: "{{ raw_udev_rule | b64encode | regex_replace('\\n$', '') }}"
+
+    - name: Debug Output
+      ansible.builtin.debug:
+        msg: "{{ udev_rule_b64 }}"
+
+    - name: Deploy MachineConfig to OpenShift
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: MachineConfig
+          metadata:
+            labels:
+              machineconfiguration.openshift.io/role: storage
+            name: storage-udev-configuration
+          spec:
+            config:
+              ignition:
+                config: {}
+                security:
+                  tls: {}
+                timeouts: {}
+                version: 2.2.0
+              networkd: {}
+              passwd: {}
+              storage:
+                files:
+                  - contents:
+                      source: 'data:text/plain;charset=utf-8;base64,{{ udev_rule_b64 }}'
+                      verification: {}
+                    filesystem: root
+                    mode: 420
+                    path: /etc/udev/rules.d/99-ibm.rules
+            osImageURL: ''
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+
+    - name: Wait for LVD to Start Scanning
+      pause:
+        minutes: 8
+
+

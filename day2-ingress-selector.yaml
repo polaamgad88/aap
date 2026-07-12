@@ -1,0 +1,45 @@
+---
+- name: Label Nodes
+## localhost since the targeted cluster is not listed in the inventory. other than thatm, should be the invintatory reference
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+    - name: patch ingresscontroller
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: operator.openshift.io/v1
+          kind: IngressController
+          metadata:
+            name: default
+            namespace: openshift-ingress-operator
+            labels:
+              controlled-by: Ansible
+          spec:
+            nodePlacement:
+              nodeSelector:
+                matchLabels:
+                  node-role.kubernetes.io/infra: ''
+
+

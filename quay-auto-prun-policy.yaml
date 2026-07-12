@@ -8,6 +8,7 @@
     namespace_name: ""
     env_name: ""
 
+
   tasks:
     - name: Process namespace name to generate org_name
       set_fact:
@@ -37,5 +38,8 @@
       register: output
       when: env_name == "prod"
 
+
     - ansible.builtin.debug:
         msg: "{{ output }}"
+
+

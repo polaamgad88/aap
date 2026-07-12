@@ -1,0 +1,73 @@
+---
+- name: day2-apply-sync-configmap
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+
+    - name: Create LDAP Sync ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ldap-group-syncer
+            namespace: openshift-authentication
+            labels:
+              app: cronjob-ldap-group-sync
+          data:
+            ldap-group-sync.yaml: >
+              kind: LDAPSyncConfig
+
+              apiVersion: v1
+
+              url: ldaps://ldapv01.aramco.com.sa:3269
+
+              bindDN: CN=OCP-LDAP-PRD,OU=Service Accounts,OU=Corporate Accounts,DC=aramco,DC=com
+
+              bindPassword:
+                file: "/etc/secrets/bindPassword"
+              ca: /etc/ldap-ca/ca-bundle.crt
+
+              insecure: false
+
+              rfc2307:
+                  groupsQuery:
+                    baseDN: "DC=aramco,DC=com"
+                    scope: sub
+                    derefAliases: never
+                    filter: "(&(objectclass=group))"
+                  groupUIDAttribute: dn
+                  groupNameAttributes: [ cn ]
+                  groupMembershipAttributes: [ member ]
+                  usersQuery:
+                      baseDN: "DC=aramco,DC=com"
+                      scope: sub
+                      derefAliases: never
+                      pageSize: 0
+                  userUIDAttribute: dn
+                  userNameAttributes: [ sAMAccountName ]
+                  tolerateMemberNotFoundErrors: true
+                  tolerateMemberOutOfScopeErrors: true

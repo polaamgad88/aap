@@ -1,0 +1,35 @@
+---
+- name: apply-ldap-bind-secret
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+
+    - name: Create instant job from CronJob
+      shell: | 
+        export KUBECONFIG=/tmp/kubeconfig
+        oc create job ldap-sync-manual --from=cronjob/ldap-group-syncer -n openshift-authentication --insecure-skip-tls-verify
+      register: output
+
+    - name: show
+      debug:
+        msg: "{{ output.stdout }}"

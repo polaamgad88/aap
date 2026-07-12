@@ -1,0 +1,61 @@
+---
+- name: Remove Self Provisioner binding
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    kubeconfig_b64: "{{ kubeconfig_b64 | default('') }}"
+    validate_certs: false
+    remove_clusterrole: false  # Set to true if you also want to remove the ClusterRole itself
+
+  tasks:
+    - name: Fail if kubeconfig is empty
+      fail:
+        msg: "kubeconfig_b64 is empty or not defined."
+      when: kubeconfig_b64 | trim == ""
+
+    - name: Create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+        # Check if decoding was successful (basic validation)
+      register: kubeconfig_file
+
+    - name: Remove Self Provisioner ClusterRoleBinding
+      kubernetes.core.k8s:
+        state: absent
+        kubeconfig: "/tmp/kubeconfig"
+        verify_ssl: "{{ validate_certs }}"
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: self-provisioners
+      when: not remove_clusterrole  # Only remove binding if we're not removing the role
+    - name: Remove Self Provisioner ClusterRole
+      kubernetes.core.k8s:
+        state: absent
+        kubeconfig: "/tmp/kubeconfig"
+        verify_ssl: "{{ validate_certs }}"
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: self-provisioner
+    - name: Remove Self Provisioner ClusterRole (Optional)
+      kubernetes.core.k8s:
+        state: absent
+        kubeconfig: "/tmp/kubeconfig"
+        verify_ssl: "{{ validate_certs }}"
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: self-provisioner
+      when:
+        - remove_clusterrole | default(false) | bool
+        - kubeconfig_file is succeeded

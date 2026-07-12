@@ -1,0 +1,72 @@
+---
+- name: sync API Certificate 
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+  vars:
+
+    cluster_id: ""
+    kubeconfig_b64: ""
+    validate_certs: false
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    kubeconfig_path: "/tmp/kubeconfig"
+    route_crt_path: "/tmp/route.crt"
+    route_key_path: "/tmp/route.key"
+    secret_namespace: "aap"
+    route_governance_secret_name: "aramco-route-cert-governance"
+    api_governance_secret_name: ""
+
+  tasks:
+
+    # ----- Paashub cluster Section | get Secret ------ #
+    - name: Login to paashub
+      command: >
+        oc login https://api.paashub.aramco.com.sa:6443 -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      changed_when: false
+
+    - name: Extract and Decode API Secret to /tmp files
+      shell: |
+        oc get secret aramco-route-cert-governance -n aap -o jsonpath='{.data.tls\.crt}' | base64 -d > {{ route_crt_path }}
+        oc get secret aramco-route-cert-governance -n aap -o jsonpath='{.data.tls\.key}' | base64 -d > {{ route_key_path }}
+      changed_when: false
+      
+    # ----- targeted Section ------ #
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "{{ kubeconfig_path }}"
+        mode: "0600"
+
+    - name: Apply TLS Secret
+      shell: |
+        export KUBECONFIG={{ kubeconfig_path }}
+        oc create secret tls aramco-route-cert \
+          --cert={{ route_crt_path }} \
+          --key={{ route_key_path }} \
+          -n openshift-config \
+          --dry-run=client -o yaml | oc apply -f -
+
+    - name: Patch Cluster Proxy TrustedCA
+      kubernetes.core.k8s:
+        state: patched
+        kubeconfig: "/tmp/kubeconfig"
+        verify_ssl: "false"
+        kind: IngressController
+        name: default
+        namespace:
+        definition:
+          spec:
+            servingCerts:
+              namedCertificates:
+                - names: ["api.{{ cluster_id }}.aramco.com.sa"]
+                  servingCertificate:
+                    name: aramco-api-cert
+            tlsSecurityProfile:
+              type: Intermediate
+ 

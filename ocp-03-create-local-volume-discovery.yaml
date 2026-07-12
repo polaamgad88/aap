@@ -1,0 +1,56 @@
+---
+- name: Apply Local Volume Discovery (LVD)
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+    storage_nodes:
+      - "ocp-{{ cluster_id }}-odf01"
+      - "ocp-{{ cluster_id }}-odf02"
+      - "ocp-{{ cluster_id }}-odf03"
+
+  tasks:
+    - name: Fail if kubeconfig is empty
+      fail:
+        msg: "EMPTY KUBECONFIG"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+
+    - name: Create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+
+    - name: Create LocalVolumeDiscovery Resource
+      kubernetes.core.k8s:
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: local.storage.openshift.io/v1alpha1
+          kind: LocalVolumeDiscovery
+          metadata:
+            name: auto-discover-devices
+            namespace: openshift-local-storage
+          spec:
+            nodeSelector:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values:
+                        - ocp-"{{ cluster_id }}"-odf03
+                        - ocp-"{{ cluster_id }}"-odf01
+                        - ocp-"{{ cluster_id }}"-odf02
+
+    - name: Wait for LVD to Start Scanning
+      pause:
+        minutes: 2
+
+

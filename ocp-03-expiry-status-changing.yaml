@@ -1,0 +1,200 @@
+## NOT Working efficent
+---
+- name: Namespace Certification Status Management (All Aramco Namespaces)
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  vars:
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+    cluster_id: "s01"
+    namespace_prefix: "aramco-"
+
+  # Cluster API URL logic
+  cluster_api: |
+    {% if cluster_id == 'ibmdev' %}
+    https://api.{{ cluster_id }}.aramco.com:6443
+    {% else %}
+    https://api.{{ cluster_id }}.aramco.com.sa:6443
+    {% endif %}
+
+  tasks:
+    # --- Step 0: Calculate Threshold Dates ---
+    - name: Get today's date
+      command: date +%Y-%m-%d
+      changed_when: false
+      register: today_cmd
+
+    - name: Set today's date fact
+      set_fact:
+        today_date: "{{ today_cmd.stdout | trim }}"
+
+    - name: Calculate 'About-to-Expire' Threshold (Today + 1 Month)
+      # Note: 'date -d' is GNU date (Linux/Mac). Ensure your local system supports this.
+      command: date -d "+1 month" +%Y-%m-%d
+      changed_when: false
+      register: expire_1m_cmd
+
+    - name: Calculate 'Expired' Threshold (Today + 3 Days)
+      command: date -d "+3 days" +%Y-%m-%d
+      changed_when: false
+      register: expire_3d_cmd
+
+    - name: Set threshold dates
+      set_fact:
+        about_to_expire_threshold: "{{ expire_1m_cmd.stdout | trim }}"
+        expired_threshold: "{{ expire_3d_cmd.stdout | trim }}"
+
+    # --- Step 1: Authenticate ---
+    - name: Login to OpenShift ({{ cluster_id }})
+      command: >
+        oc login {{ cluster_api | trim }}
+        -u {{ ldap_user }}
+        --password={{ ldap_password }}
+        --insecure-skip-tls-verify
+      register: login_result
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if login failed
+      fail:
+        msg: "Failed to login to {{ cluster_id }}. Please check credentials."
+      when: login_result.rc != 0
+
+    - name: Get Token for automation user
+      command: oc whoami --show-token
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+
+    - name: Set token fact
+      set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+      when: cluster_token.rc == 0
+
+    - name: Fail if token retrieval failed
+      fail:
+        msg: "Failed to retrieve token from cluster {{ cluster_id }}."
+      when: openshift_cluster_token is not defined or openshift_cluster_token | length == 0
+
+    # --- Step 2: Discover All Aramco Namespaces ---
+    - name: List all namespaces starting with '{{ namespace_prefix }}'
+      command: "oc get namespaces -l name={{ namespace_prefix }}* -o jsonpath='{.items[*].metadata.name}'"
+      register: ns_list_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Parse namespace list
+      set_fact:
+        # Split by space, then filter out any empty strings resulting from extra whitespace
+        aramco_namespaces: >-
+          {{ 
+            ns_list_raw.stdout.split(' ') 
+            | reject('equalto', '') 
+            | list 
+          }}
+      when: ns_list_raw.rc == 0 and ns_list_raw.stdout | length > 0
+
+    - name: Fail if no Aramco namespaces found
+      fail:
+        msg: "No namespaces found with prefix '{{ namespace_prefix }}' in cluster {{ cluster_id }}."
+      when: aramco_namespaces is not defined or aramco_namespaces | length == 0
+
+    - name: Debug Discovered Namespaces
+      debug:
+        msg: "Found namespaces: {{ aramco_namespaces }}"
+
+    # --- Step 3: Process Each Namespace ---
+    
+    # PART A: Fetch all namespace data in one go
+    - name: Fetch Namespace details for all items
+      kubernetes.core.k8s_info:
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api | trim }}"
+        validate_certs: "{{ validate_certs }}"
+        kind: Namespace
+        name: "{{ item }}"
+      register: namespace_fetch_results
+      loop: "{{ aramco_namespaces }}"
+      loop_control:
+        label: "{{ item }}"
+      ignore_errors: yes
+
+    # PART B: Process the fetched data
+    - name: Process Status for each namespace
+      loop: "{{ namespace_fetch_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        # Skip if the previous task failed or returned no resources
+        - item.failed is not defined
+        - item.results is defined
+        - item.results | length > 0
+
+      block:
+        - name: Extract current labels and dates
+          set_fact:
+            ns_name: "{{ item.results[0].metadata.name }}"
+            # Default to '1970-01-01' if label is missing (will trigger 'expired')
+            current_expiry: "{{ item.results[0].metadata.labels.get('expiry-date', '1970-01-01') }}"
+            # Default to 'certified' if label is missing
+            current_status: "{{ item.results[0].metadata.labels.get('certification-status', 'certified') }}"
+
+        - name: Calculate New Certification Status
+          set_fact:
+            new_status: |
+              {% if current_expiry < expired_threshold %}
+              expired
+              {% elif current_expiry < about_to_expire_threshold %}
+              about-to-expire
+              {% else %}
+              certified
+              {% endif %}
+
+        - name: Debug Status Calculation
+          debug:
+            msg: >
+              Namespace: {{ ns_name }} |
+              Current Expiry: {{ current_expiry }} |
+              Thresholds: Expired(<{{ expired_threshold }}), About-To-Expire(<{{ about_to_expire_threshold }}) |
+              Old Status: {{ current_status }} |
+              New Status: {{ new_status }}
+
+        - name: Check if status needs update
+          set_fact:
+            status_changed: "{{ current_status != new_status }}"
+
+        - name: Report No Change
+          debug:
+            msg: "Namespace {{ ns_name }} is already '{{ current_status }}'. No update required."
+          when: not status_changed
+
+        - name: Prepare patch definition
+          set_fact:
+            patch_definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: "{{ ns_name }}"
+                labels:
+                  certification-status: "{{ new_status }}"
+
+        - name: Update Namespace Status Label
+          kubernetes.core.k8s:
+            api_key: "{{ openshift_cluster_token }}"
+            host: "{{ cluster_api | trim }}"
+            validate_certs: "{{ validate_certs }}"
+            state: patched
+            definition: "{{ patch_definition }}"
+          register: patch_result
+          when: status_changed
+
+        - name: Report Final Status
+          debug:
+            msg: >
+              Cluster: {{ cluster_id }} |
+              Namespace: {{ ns_name }} |
+              Old Status: {{ current_status }} |
+              New Status: {{ new_status }} |
+              Result: {{ 'Updated' if patch_result.changed else 'No Change' }}

@@ -10,14 +10,13 @@
     upstream_username: ""
     upstream_registry: ""
     upstream_password: ""
-
+    
   tasks:
     - name: Execute Proxy Cache Logic
       block:
         - name: Process namespace name to generate org_name
           set_fact:
             org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}"
-
         - name: Ensure Proxy Cache is enabled in Organization
           quay_proxy_cache:
             organization: "{{ org_name }}"
@@ -30,7 +29,6 @@
             quay_token: "{{ quay_token }}"
             validate_certs: false
           register: output
-
       when:
         - upstream_registry is defined
         - upstream_registry | length > 0

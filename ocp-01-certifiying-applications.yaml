@@ -1,0 +1,142 @@
+---
+- name: Label Aramco Namespaces with Dynamic Certification Status
+  hosts: s01
+  # Option 1: Keep gather_facts: no, but add a task to get the date via command
+  gather_facts: no
+  connection: local
+  vars:
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+    
+    # Define the label values to apply
+    target_status: "certified"
+    
+    # Cluster API URL logic
+    cluster_api: |
+      {% if inventory_hostname == 'ibmdev' %}
+      https://api.{{ inventory_hostname }}.aramco.com:6443
+      {% else %}
+      https://api.{{ inventory_hostname }}.aramco.com.sa:6443
+      {% endif %}
+
+  tasks:
+    # --- Step 0: Calculate Expiry Date ---
+    # Since connection is 'local', we can use the 'command' module to get the date 
+    # from the control node's OS, avoiding any Ansible filters.
+    - name: Get current date and calculate expiry date (3 months from now)
+      command: date -d "+3 months" +%Y-%m-%d
+      changed_when: false
+      register: expiry_date_command
+
+    - name: Set expiry date fact
+      set_fact:
+        target_expiry: "{{ expiry_date_command.stdout | trim }}"
+
+    # --- Step 1: Login to OpenShift ---
+    - name: Login to OpenShift ({{ inventory_hostname }})
+      command: >
+        oc login {{ cluster_api }}
+        -u {{ ldap_user }}
+        --password={{ ldap_password }}
+        --insecure-skip-tls-verify
+      register: login_result
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if login failed
+      fail:
+        msg: "Failed to login to {{ inventory_hostname }}. Please check credentials."
+      when: login_result.rc != 0
+
+    - name: Get Token of automation user ({{ inventory_hostname }})
+      command: oc whoami --show-token
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+
+    - name: Set token cleaner for {{ inventory_hostname }}
+      set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+
+    - name: Fail if token is empty for {{ inventory_hostname }}
+      fail:
+        msg: "Failed to get token for {{ inventory_hostname }}. Token is empty."
+      when: openshift_cluster_token is not defined or openshift_cluster_token | length == 0
+
+    - name: Check if user can access namespaces ({{ inventory_hostname }})
+      command: oc auth can-i get namespaces
+      register: auth_check
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Fail if user lacks namespace permissions
+      fail:
+        msg: "User {{ ldap_user }} does not have permission to read namespaces on {{ inventory_hostname }}. Please grant 'cluster-admin' or 'view' permissions."
+      when: auth_check.stdout != "yes"
+
+    # --- Step 2: Identify Namespaces ---
+    - name: Get Namespaces matching 'aramco-*'
+      kubernetes.core.k8s_info:
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        kind: Namespace
+      register: all_namespaces
+
+    - name: Filter namespaces starting with 'aramco-' and prepare label data
+      set_fact:
+        namespaces_to_process: "{{ namespaces_to_process | default([]) + [ {
+            'name': item.metadata.name,
+            'existing_status': (item.metadata.labels.get('certification-status', 'missing')),
+            'existing_expiry': (item.metadata.labels.get('expiry-date', 'missing'))
+          } ] }}"
+      loop: "{{ all_namespaces.resources }}"
+      when: item.metadata.name is match('aramco-.*')
+      no_log: true
+
+    - name: Fail if no matching namespaces found
+      fail:
+        msg: "No namespaces starting with 'aramco-' found in cluster {{ inventory_hostname }}."
+      when: namespaces_to_process is not defined or namespaces_to_process | length == 0
+
+    # --- Step 3: Patch Only Changed Namespaces ---
+    - name: Patch Namespace Labels
+      kubernetes.core.k8s:
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        state: patched
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item.name }}"
+            labels:
+              certification-status: "{{ target_status }}"
+              expiry-date: "{{ target_expiry }}"
+      loop: "{{ namespaces_to_process }}"
+      loop_control:
+        label: "Namespace: {{ item.name }}"
+      when: 
+        # Condition 1: Labels are missing (new namespace)
+        - item.existing_status == 'missing' or item.existing_expiry == 'missing'
+        # OR Condition 2: Values have changed (date updated or status changed)
+        - item.existing_status != target_status or item.existing_expiry != target_expiry
+      register: label_patch_results
+
+    # --- Step 4: Summary ---
+    - name: Show Labeling Summary for {{ inventory_hostname }}
+      debug:
+        msg: >
+          Cluster: {{ inventory_hostname }} | 
+          Namespace: {{ item.item.name }} | 
+          Action: "{{ 'Patched' if item.changed else 'Skipped (Already Correct)' }}" |
+          New Expiry: {{ target_expiry }}
+      loop: "{{ label_patch_results.results }}"
+      no_log: true
+
+    - name: Report Final Status per Cluster
+      debug:
+        msg: "Cluster {{ inventory_hostname }}: Processed {{ namespaces_to_process | length }} namespaces. Expiry Date Set To: {{ target_expiry }}"

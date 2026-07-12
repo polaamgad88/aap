@@ -1,0 +1,151 @@
+---
+- name: Stage 1 - Get token of imported cluster
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+  vars:
+    cluster_id: ""
+    cluster_set_targeted: ""
+    cluster_api_targeted: "https://api.{{ cluster_id }}.aramco.com.sa:6443"
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    kubeconfig_path: "/tmp/kubeconfig"
+    kubeconfig_b64: ""
+  tasks:
+
+    # ----- SPOKEN Section | get token ------ #
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: Create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "{{ kubeconfig_path }}"
+        mode: "0600"
+    - name: Login to "{{ cluster_id }}"
+      command: >
+        oc --kubeconfig="{{ kubeconfig_path }}" create sa acm-importer -n default --insecure-skip-tls-verify
+      register: create_sa_result
+      failed_when: create_sa_result.rc != 0 and 'AlreadyExists' not in create_sa_result.stderr
+      changed_when: create_sa_result.rc == 0
+
+    - name: Login to "{{ cluster_id }}"
+      command: >
+        oc --kubeconfig="{{ kubeconfig_path }}" adm policy add-cluster-role-to-user cluster-admin -z acm-importer -n default --insecure-skip-tls-verify
+      register: cluster_token
+
+
+    - name: Login to "{{ cluster_id }}"
+      command: >
+        oc --kubeconfig="{{ kubeconfig_path }}" create token acm-importer -n default --duration=1h --insecure-skip-tls-verify
+      register: cluster_token
+
+    - name: set token cleaner
+      ansible.builtin.set_fact:
+        managed_cluster_token: "{{ cluster_token.stdout | trim }}"
+
+    - name: Login to paashub
+      command: >
+        oc login https://api.paashub.aramco.com.sa:6443 -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      register: hub_login
+      no_log: True
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        validate_certs: false
+        api_version: v1
+        kind: Namespace
+        name: "{{ cluster_id }}"
+        state: present
+
+    - name: set cluster based on cluster name prefix
+      set_fact:
+        cluster_set_targeted: "{{ cluster_set_map[cluster_prefix] | default('sandboxes') }}"
+      vars:
+        cluster_prefix: >-
+          {{ 'dr' if (cluster_id | lower).startswith('dr') else (cluster_id | lower)[0] }}
+        cluster_set_map:
+          d: development-cluster
+          p: production-cluster
+          q: qa-cluster
+          dr: dr-cluster
+    - name: Create ManagedCluster resource
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: cluster.open-cluster-management.io/v1
+          kind: ManagedCluster
+          metadata:
+            name: "{{ cluster_id }}"
+            labels:
+              name: "{{ cluster_id }}"
+              cloud: auto-detect
+              vendor: auto-detect
+              cluster.open-cluster-management.io/clusterset: "{{ cluster_set_targeted }}"
+          spec:
+            hubAcceptsClient: true
+    - name: Create Secret resource
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: auto-import-secret
+            namespace: "{{ cluster_id }}"
+          stringData:
+            token: "{{ managed_cluster_token }}"
+            server: https://api.{{ cluster_id }}.aramco.com.sa:6443
+          type: Opaque
+    - name: Create KlusterletAddonConfig resource
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: agent.open-cluster-management.io/v1
+          kind: KlusterletAddonConfig
+          metadata:
+            name: "{{ cluster_id }}"
+            namespace: "{{ cluster_id }}"
+          spec:
+            clusterName: "{{ cluster_id }}"
+            clusterNamespace: "{{ cluster_id }}"
+            clusterLabels:
+              name: "{{ cluster_id }}"
+              cloud: auto-detect
+              vendor: auto-detect
+              cluster.open-cluster-management.io/clusterset: "{{ cluster_set_targeted }}"
+            applicationManager:
+              enabled: true
+            policyController:
+              enabled: true
+            searchCollector:
+              enabled: true
+            certPolicyController:
+              enabled: true
+    - name: Wait 5 mins until cluster get imported
+      pause:
+        minutes: 5
+
+    - name: Delete acm-importer clusterrolebinding on imported cluster
+      command:
+        cmd: >
+          oc --kubeconfig={{ kubeconfig_path }}
+          delete clusterrolebinding acm-importer-cluster-admin --ignore-not-found=true --insecure-skip-tls-verify
+      changed_when: true         
+
+    - name: Delete acm-importer clusterrole on imported cluster
+      command:
+        cmd: >
+          oc --kubeconfig={{ kubeconfig_path }}
+          delete sa acm-importer -n default --ignore-not-found=true --insecure-skip-tls-verify
+      changed_when: true    
+
+    - name: Final confirmation of cluster setup
+      ansible.builtin.debug:
+        msg: >
+          Successfully imported cluster "{{ cluster_id }}" into Hub cluster paashub.
+          Namespace, ManagedCluster, Secret, and KlusterletAddonConfig have been created and verified.

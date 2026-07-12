@@ -1,0 +1,159 @@
+---
+- name: Create nmstate Instance
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+    - infra.quay_configuration
+  vars:
+    cluster_name: ""
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+  tasks:
+    - name: Set cluster_api based on cluster_name
+      set_fact:
+        cluster_api: |
+          {% if cluster_name == 'ibmdev' %}
+          https://api.{{ cluster_name }}.aramco.com:6443
+          {% else %}
+          https://api.{{ cluster_name }}.aramco.com.sa:6443
+          {% endif %}
+    - name: Login to paashub
+      command: >
+        oc login {{ cluster_api }} -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      register: cluster_token
+      failed_when: false
+      no_log: true
+      changed_when: false
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+    - name: set token cleaner
+      ansible.builtin.set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+    - name: Create nmstate Instance
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: nmstate.io/v1
+          kind: NMState
+          metadata:
+            name: nmstate
+            labels:
+              controlled-by: Ansible
+    - name: create node network configuration policy - master
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: nmstate.io/v1
+          kind: NodeNetworkConfigurationPolicy
+          metadata:
+            name: master-dns
+            labels:
+              controlled-by: Ansible
+          spec:
+            desiredState:
+              dns-resolver:
+                config:
+                  search:
+                    - aramco.com
+                    - aramco.com.sa
+                  server:
+                    - 10.1.162.100
+                    - 10.1.182.100
+            nodeSelector:
+              node-role.kubernetes.io/master: ''
+    - name: create node network configuration policy - worker
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: nmstate.io/v1
+          kind: NodeNetworkConfigurationPolicy
+          metadata:
+            name: worker-dns
+            labels:
+              controlled-by: Ansible
+          spec:
+            desiredState:
+              dns-resolver:
+                config:
+                  search:
+                    - aramco.com
+                    - aramco.com.sa
+                  server:
+                    - 10.1.162.100
+                    - 10.1.182.100
+            nodeSelector:
+              node-role.kubernetes.io/worker: ''
+    - name: create node network configuration policy - infra
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: nmstate.io/v1
+          kind: NodeNetworkConfigurationPolicy
+          metadata:
+            name: infra-dns
+            labels:
+              controlled-by: Ansible
+          spec:
+            desiredState:
+              dns-resolver:
+                config:
+                  search:
+                    - aramco.com
+                    - aramco.com.sa
+                  server:
+                    - 10.1.162.100
+                    - 10.1.182.100
+            nodeSelector:
+              node-role.kubernetes.io/infra: ''
+    - name: create node network configuration policy - storage
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: nmstate.io/v1
+          kind: NodeNetworkConfigurationPolicy
+          metadata:
+            name: storage-dns
+            labels:
+              controlled-by: Ansible
+          spec:
+            desiredState:
+              dns-resolver:
+                config:
+                  search:
+                    - aramco.com
+                    - aramco.com.sa
+                  server:
+                    - 10.1.162.100
+                    - 10.1.182.100
+            nodeSelector:
+              node-role.kubernetes.io/storage: ''
+    - name: wait for nmstate master
+      shell: "oc get nodenetworkconfigurationpolicies.nmstate.io master-dns -ojsonpath='{.status.conditions[0].type}'"
+      register: nmstate_out_master
+      until: "'Available' in nmstate_out_master.stdout"
+      retries: 50
+      delay: 20
+    - name: wait for nmstate infra
+      shell: "oc get nodenetworkconfigurationpolicies.nmstate.io infra-dns -ojsonpath='{.status.conditions[0].type}'"
+      register: nmstate_out_infra
+      until: "'Available' in nmstate_out_infra.stdout"
+      retries: 50
+      delay: 20
+    - name: wait for nmstate worker
+      shell: "oc get nodenetworkconfigurationpolicies.nmstate.io worker-dns -ojsonpath='{.status.conditions[0].type}'"
+      register: nmstate_out_worker
+      until: "'Available' in nmstate_out_worker.stdout"
+      retries: 50
+      delay: 20
+    - name: wait for nmstate storage
+      shell: "oc get nodenetworkconfigurationpolicies.nmstate.io storage-dns -ojsonpath='{.status.conditions[0].type}'"
+      register: nmstate_out_storage
+      until: "'Available' in nmstate_out_storage.stdout"
+      retries: 50
+      delay: 20

@@ -1,0 +1,243 @@
+---
+- name: Patch Many clusters
+  # hosts: dev_clusters
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+  vars:
+    # cluster_name: "{{ inventory_hostname }}"
+    cluster_name: ""
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    cluster_api: "https://api.{{ cluster_name }}.aramco.com.sa:6443"
+  tasks:
+    - name: Login to {{ cluster_name }}
+      command: >
+        oc login {{ cluster_api | trim }} 
+        -u {{ ldap_user }} 
+        -p {{ ldap_password }} 
+        --insecure-skip-tls-verify
+      register: login_result
+      no_log: true
+    - name: Fail if login was unsuccessful
+      fail:
+        msg: "Failed to login to {{ cluster_name }} at {{ cluster_api }}"
+      when: login_result.rc != 0
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: token_result
+      changed_when: false
+      no_log: true
+    - name: Set openshift_cluster_token fact
+      ansible.builtin.set_fact:
+        openshift_cluster_token: "{{ token_result.stdout | trim }}"
+      when: token_result.rc == 0
+
+    - name: Check ClusterVersion Conditions for Blocked Upgrades
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api | trim }}"
+        api_key: "{{ openshift_cluster_token | trim }}"
+        api_version: config.openshift.io/v1
+        validate_certs: false
+        kind: ClusterVersion
+        name: version
+      register: cv_conditions_check
+      failed_when: false  # We will handle the fail logic manually to provide better error messages
+
+    - name: Fail if ClusterUpgrade is blocked or degraded
+      fail:
+        msg: "Cluster {{ cluster_name }} is not ready for patching. Reason: {{ item.message }}"
+      when:
+        - cv_conditions_check.resources is defined
+        - cv_conditions_check.resources | length > 0
+        - cv_conditions_check.resources[0].status.conditions is defined
+        - cv_conditions_check.resources[0].status.conditions | length > 0
+        - cv_conditions_check.resources[0].status.conditions | selectattr('type', 'equalto', 'Invalid') | list | length > 0
+        - cv_conditions_check.resources[0].status.conditions | selectattr('type', 'equalto', 'Invalid') | first | json_query('message') | length > 0
+
+    - name: Check for Active Cluster Operator Degradations
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api | trim }}"
+        api_key: "{{ openshift_cluster_token | trim }}"
+        api_version: config.openshift.io/v1
+        validate_certs: false
+        kind: ClusterOperator
+      register: co_status_check
+      failed_when: false
+
+    - name: Fail if Critical ClusterOperators are degraded
+      fail:
+        msg: "Critical ClusterOperator {{ item.metadata.name }} is degraded or unavailable. Status: {{ item.status.conditions | selectattr('type', 'equalto', 'Degraded') | list | first | default({}) | json_query('message') }}"
+      when:
+        - co_status_check.resources is defined
+        - co_status_check.resources | length > 0
+        - >-
+          item.status.conditions
+          | selectattr('type', 'equalto', 'Degraded')
+          | selectattr('status', 'equalto', 'True')
+          | list
+          | length > 0
+      loop: "{{ co_status_check.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+
+    - name: Check for Disk Pressure on Nodes
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api | trim }}"
+        api_key: "{{ openshift_cluster_token | trim }}"
+        api_version: v1
+        kind: Node
+      register: node_disk_check
+      failed_when: false
+
+    - name: Fail if Nodes have DiskPressure
+      fail:
+        msg: "Node {{ item.metadata.name }} is under DiskPressure. Please free up space before patching."
+      when:
+        - node_disk_check.resources is defined
+        - node_disk_check.resources | length > 0
+        - item.status.conditions | selectattr('type', 'equalto', 'DiskPressure') | list | length > 0
+        - item.status.conditions | selectattr('type', 'equalto', 'DiskPressure') | first | json_query('status') | default('True') == 'True'
+      loop: "{{ node_disk_check.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Check for Node Conditions (NotReady or DiskPressure)
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api | trim }}"
+        api_key: "{{ openshift_cluster_token | trim }}"
+        api_version: v1
+        kind: Node
+      register: node_conditions_check
+      failed_when: false
+
+    - name: Fail if Nodes are in NotReady state
+      fail:
+        msg: "Node {{ item.metadata.name }} is NotReady. Pre-patch health check failed."
+      when:
+        - node_conditions_check.resources is defined
+        - node_conditions_check.resources | length > 0
+        - item.status.conditions | selectattr('type', 'equalto', 'Ready') | list | first | json_query('status') | default('True') == 'False'
+      loop: "{{ node_conditions_check.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: Pre-Patch Health Check Summary
+      ansible.builtin.debug:
+        msg: "Pre-patch health checks passed for {{ cluster_name }}."
+
+
+    - name: Get Cluster Version info
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api | trim }}"
+        api_key: "{{ openshift_cluster_token | trim }}"
+        api_version: config.openshift.io/v1
+        validate_certs: false
+        kind: ClusterVersion
+        name: version
+      register: cv_info
+
+    - name: Set Cluster Version variables
+      ansible.builtin.set_fact:
+        current_ver: "{{ cv_info.resources[0].status.history[0].version }}"
+        current_channel: "{{ cv_info.resources[0].spec.channel }}"
+        target_version: "{{ cv_info.resources[0].status.availableUpdates[0].version }}"
+      when: 
+        - cv_info.resources is defined
+        - cv_info.resources | length > 0
+        - cv_info.resources[0].status.availableUpdates is defined
+        - cv_info.resources[0].status.availableUpdates | length > 0
+
+    - name: Safety Check - Ensure Channel is stable
+      ansible.builtin.fail:
+        msg: "Critical: Patching is BLOCKED, you are on {{ current_channel }}. Only stable is allowed in patching"
+      when: "'stable' not in current_channel"
+
+    - name: Check if upgrade is needed
+      ansible.builtin.set_fact:
+        skip_upgrade: true
+      when:
+        - target_version is defined
+        - current_ver is defined
+        - current_ver == target_version
+
+    - name: Report current status
+      ansible.builtin.debug:
+        msg: "Cluster {{ cluster_name }} is at {{ current_ver }}. Target is {{ target_version }}. Upgrade will be {{ 'skipped' if skip_upgrade is defined else 'executed' }}."
+      when: target_version is defined
+
+    - name: Patching OCP cluster Z-Stream patch
+      command: >
+        oc adm upgrade --to={{ target_version }}
+        --server={{ cluster_api | trim }}
+        --token={{ openshift_cluster_token | trim }}
+        --insecure-skip-tls-verify
+      register: patch_result
+      when:
+        - target_version is defined
+        - skip_upgrade is not defined
+        - openshift_cluster_token is defined
+
+
+
+    - name: Wait for Cluster Version Update to Complete
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api | trim }}"
+        api_key: "{{ openshift_cluster_token | trim }}"
+        api_version: config.openshift.io/v1
+        validate_certs: false
+        kind: ClusterVersion
+        name: version
+      register: cv_update_status
+      # Loop until the cluster is available and not progressing
+      until: >
+        cv_update_status.resources is defined and
+        cv_update_status.resources | length > 0 and
+        # Check if Progressing is False
+        (cv_update_status.resources[0].status.conditions | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first | default('True') | lower) == 'false' and
+        # Check if Available is True
+        (cv_update_status.resources[0].status.conditions | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first | default('False') | lower) == 'true'
+      retries: "{{ (upgrade_timeout_seconds / wait_check_interval_seconds) | int }}"
+      delay: "{{ wait_check_interval_seconds }}"
+      ignore_errors: true
+
+    - name: Check if Wait for Update Failed or Timed Out
+      fail:
+        msg: >-
+          Cluster {{ cluster_name }} failed to upgrade to {{ target_version }} 
+          within {{ upgrade_timeout_seconds }} seconds. 
+          Final Status: 
+          Progressing: {{ (cv_update_status.resources[0].status.conditions | selectattr('type', 'equalto', 'Progressing') | map(attribute='status') | list | first | default('Unknown')) }},
+          Available: {{ (cv_update_status.resources[0].status.conditions | selectattr('type', 'equalto', 'Available') | map(attribute='status') | list | first | default('Unknown')) }}
+      when:
+        - cv_update_status.failed is defined and cv_update_status.failed == true
+        - cv_update_status.resources is defined
+        - cv_update_status.resources | length > 0
+
+    - name: Verify Final Version
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api | trim }}"
+        api_key: "{{ openshift_cluster_token | trim }}"
+        api_version: config.openshift.io/v1
+        validate_certs: false
+        kind: ClusterVersion
+        name: version
+      register: final_cv_info
+      # Only run if the wait succeeded (not failed)
+      when: cv_update_status.failed is not defined or cv_update_status.failed == false
+
+    - name: Fail if Final Version does not match Target
+      fail:
+        msg: >-
+          Upgrade failed. The cluster reports version mismatch. 
+          Current Version: {{ final_cv_info.resources[0].status.history[0].version }}, 
+          Expected Version: {{ target_version }}.
+          Please check cluster logs for reconciliation errors.
+      when:
+        - final_cv_info.resources is defined
+        - final_cv_info.resources | length > 0
+        - final_cv_info.resources[0].status.history is defined
+        - final_cv_info.resources[0].status.history | length > 0
+        - final_cv_info.resources[0].status.history[0].version != target_version

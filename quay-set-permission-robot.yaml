@@ -7,19 +7,20 @@
   vars:
     namespace_name: ""
     env_name: ""
-
+    
   tasks:
     - name: Process namespace name to generate org_name
       set_fact:
-        org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}"
+        org_name: "ar-{{ env_name }}{{ namespace_name[6:] }}" 
 
     - name: Configure Quay
       quay_default_perm:
         organization: "{{ org_name }}"
         name: "{{ org_name }}+deployer_quay"
-        type: user
+        type: user    
         state: present
         role: read
         quay_host: https://quay.apps.paashub.aramco.com.sa
-        quay_token: "{{ quay_token }}"
+        # quay_token: "{{ quay_token }}"
+        quay_token: "myUi9yIORYEBxCvvdhPMW44avt9tzSlbRziNHOXT"
         validate_certs: false

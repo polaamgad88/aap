@@ -1,0 +1,73 @@
+---
+- name: OpenShift Pre-Patch Cleanup (Delete openshift-debug- namespaces)
+  hosts: intranet_clusters
+  gather_facts: no
+  connection: local
+  serial: 1
+  vars:
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    base_domain: "aramco.com.sa"
+    api_port: "6443"
+    prefix_to_delete: "openshift-debug-"
+    kubeconfig_path: "/tmp/ansible_{{ inventory_hostname }}_kubeconfig"
+
+  tasks:
+    # 1. Login to the cluster (NO no_log here to see errors)
+    - name: Login to OpenShift Cluster
+      shell: |
+        export KUBECONFIG={{ kubeconfig_path }}
+        oc login https://api.{{ inventory_hostname }}.{{ base_domain }}:{{ api_port }} \
+          -u {{ ldap_user }} \
+          -p {{ ldap_password }} \
+          --insecure-skip-tls-verify
+      register: login_result
+      changed_when: false
+      # REMOVED no_log: true so we can see the error
+      # REMOVED failed_when: false so the play stops on error
+
+    - name: Fail if Login Failed
+      fail:
+        msg: "Login failed for {{ inventory_hostname }}. Error: {{ login_result.stderr }}"
+      when: login_result.rc != 0
+
+    - name: Get namespaces
+      shell: |
+        export KUBECONFIG={{ kubeconfig_path }}
+        oc get namespaces -o jsonpath='{.items[*].metadata.name}'
+      register: ns_raw_output
+      changed_when: false
+      no_log: true
+
+    - name: Debug raw namespace output
+      debug:
+        msg: "Raw NS output for {{ inventory_hostname }}: '{{ ns_raw_output.stdout }}'"
+      when: ns_raw_output.rc == 0
+
+
+    - name: Filter namespaces to delete
+      set_fact:
+        namespaces_to_delete: >-
+          {{ 
+            ns_raw_output.stdout 
+            | split 
+            | select('match', '^' + prefix_to_delete) 
+            | list 
+          }}
+      when: ns_raw_output.rc == 0
+
+    
+    - name: Debug filtered namespaces
+      debug:
+        msg: "To delete on {{ inventory_hostname }}: {{ namespaces_to_delete }}"
+      when: namespaces_to_delete | length > 0
+
+    - name: Delete matching namespaces
+      shell: |
+        export KUBECONFIG={{ kubeconfig_path }}
+        for ns in {{ namespaces_to_delete | join(' ') }}; do
+          oc delete namespace $ns --wait=false
+        done
+      when: namespaces_to_delete | length > 0
+      no_log: true
+      ignore_errors: true

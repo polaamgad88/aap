@@ -1,0 +1,211 @@
+---
+- name: OpenShift Pre-Patch Health Check
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+    - community.general
+
+  vars:
+    cluster_id: "d08"
+    cluster_api: "https://api.{{ cluster_id }}.aramco.com.sa:6443"
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+
+  tasks:
+    - name: Login to {{ cluster_id }}
+      command: >
+        oc login {{ cluster_api }} -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      register: cluster_token
+      failed_when: false
+      no_log: true
+      changed_when: false
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+
+
+    - name: set token cleaner
+      ansible.builtin.set_fact:
+        api_token: "{{ cluster_token.stdout | trim }}"
+
+
+
+    # =================================================================================
+    #  NODE HEALTH CHECK
+    # =================================================================================
+    - name: Fetch Node Status
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api }}"
+        api_key: "{{ api_token }}"
+        kind: Node
+        api_version: v1
+        validate_certs: false
+
+      register: nodes_info
+
+    - name: Check if all nodes are Ready
+      ansible.builtin.set_fact:
+        not_ready_nodes: >
+          {{
+            nodes_info.resources | selectattr('status.conditions', 'match', '.*Ready.*False.*') | list
+          }}
+      no_log: true
+
+    - name: Report Node Health
+      ansible.builtin.debug:
+        msg:
+          - "Total Nodes: {{ nodes_info.resources | length }}"
+          - "Not Ready Nodes: {{ not_ready_nodes | length }}"
+          - "Degraded Nodes: {{ not_ready_nodes | map(attribute='metadata.name') | list }}"
+      when: not_ready_nodes | length > 0
+
+    # =================================================================================
+    # CLUSTEROPERATOR STATUS CHECK
+    # =================================================================================
+    - name: Fetch ClusterOperator Status
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api }}"
+        api_key: "{{ api_token }}"
+        api_version: config.openshift.io/v1
+        kind: ClusterOperator
+        validate_certs: false
+      register: co_info
+
+
+
+    - name: Extract Degraded ClusterOperators
+      ansible.builtin.set_fact:
+        degraded_co: |
+          {{
+            co_info.resources |
+            selectattr('status.conditions', 'defined') |
+            select('match', 'Degraded') |
+            select('match', 'True', 'status') |
+            list
+          }}
+      no_log: true
+    - name: Report ClusterOperator Health
+      ansible.builtin.debug:
+        msg:
+          - "Total ClusterOperators: {{ co_info.resources | length }}"
+          - "Degraded Operators: {{ degraded_co | length }}"
+          - "Degraded: {{ degraded_co | map(attribute='metadata.name') | list }}"
+      when: degraded_co | length > 0
+
+    # =================================================================================
+    #  ETCD HEALTH STATUS
+    # =================================================================================
+    # - name: Fetch ClusterOperator Status
+    #   kubernetes.core.k8s_info:
+    #     host: "{{ cluster_api }}"
+    #     api_key: "{{ api_token }}"
+    #     api_version: config.openshift.io/v1
+    #     kind: Pod
+    #     namespace: openshift-etcd
+    #     validate_certs: false
+    #   register: etcd_info
+
+    # - name: fail if any pod is not runing or succeded
+    #   fail:
+    #     msg: "Pod {{ item.metadata.name }} is in state {{ item.status.phase }}!"
+    #   loop: " {{ etcd_info.resources }}"
+    #   when:
+    #     - item.status.phase != 'Running'
+    #     - item.status.phase != 'Completed'
+    #     - item.status.phase != 'Succeeded'
+
+
+    # - name: Report unhealthy pods
+    #   fail:
+    #     msg: "The following pods are not in Running or Completed state: {{ unhealthy_pods }}"
+    #   when: unhealthy_pods is defined and unhealthy_pods | length > 0
+
+    # =================================================================================
+    # MACHINE CONFIG POOL (MCP) STATUS CHECK
+    # =================================================================================
+    - name: Fetch MCP Status
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api }}"
+        api_key: "{{ api_token }}"
+        api_version: machineconfiguration.openshift.io/v1
+        kind: MachineConfigPool
+        validate_certs: false
+      register: mcp_info
+
+
+
+    - name: Get All Etcd Pod Names
+      command: oc -n openshift-etcd get pods -l k8s-app=etcd -o jsonpath='{.items[*].metadata.name}'
+      register: etcd_pods
+      changed_when: false
+
+    - name: Check Etcd Health for Each Pod
+      command: oc -n openshift-etcd exec {{ item }} -- etcdctl --cacert=/etc/kubernetes/static-pod-resources/configmaps/etcd-serving-ca/ca.crt --cert=/etc/kubernetes/static-pod-resources/configmaps/etcd-peer-client-certs/tls.crt --key=/etc/kubernetes/static-pod-resources/configmaps/etcd-peer-client-certs/tls.key --endpoints=https://127.0.0.1:2379 endpoint health
+      loop: "{{ etcd_pods.stdout | split(' ') }}"
+      register: etcd_health_results
+      changed_when: false
+      ignore_errors: yes
+
+
+    - name: Evaluate Etcd Health
+      set_fact:
+        etcd_healthy: "{{ etcd_health_results.results |
+                          selectattr('failed', 'false') |
+                          selectattr('stdout', 'match', 'successfully committed proposal') |
+                          list }}"
+        etcd_unhealthy: "{{ etcd_health_results.results |
+                            selectattr('failed', 'true') |
+                            list + 
+                            etcd_health_results.results |
+                            selectattr('stdout', 'match', 'unhealthy') |
+                            list }}"
+
+
+    - name: Extract Unhealthy MCPs
+      ansible.builtin.set_fact:
+        unhealthy_mcp: |
+          {{
+            mcp_info.resources |
+            selectattr('status.conditions', 'defined') |
+            select('match', 'Degraded') |
+            select('match', 'True', 'status') |
+            list
+          }}
+      no_log: true
+
+
+    # - name: Report MCP Health
+    #   ansible.builtin.debug:
+    #     msg:
+    #       - "Total Machine Config Pools: {{ mcp_info.resources | length }}"
+    #       - "Degraded Pools: {{ unhealthy_mcp | length }}"
+    #       - "Degraded Pools: {{ unhealthy_mcp | map(attribute='metadata.name') | list }}"
+    #   when: unhealthy_mcp | length > 0
+
+
+
+    # - name: Report Etcd Health
+    #   ansible.builtin.debug:
+    #     msg:
+    #       - "Healthy etcd Endpoints: {{ etcd_healthy | length }}"
+    #       - "Unhealthy etcd Endpoints: {{ etcd_unhealthy | length }}"
+    #       - "Unhealthy Pod Names: {{ etcd_unhealthy | map(attribute='item') | list }}"
+    #   when: etcd_unhealthy | length > 0
+
+    # =================================================================================
+    # Final Cluster Health Summary
+    # =================================================================================
+    - name: Final Cluster Health Summary
+      ansible.builtin.debug:
+        msg:
+          - " Pre-Patch Cluster Health Check Summary"
+          - "Nodes OK: {{ 'Yes, all nodes are healthy' if not_ready_nodes | length == 0 else 'There Not ready nodes' }}"
+          - "ClusterOperators OK: {{ 'Cluster Operators are healthy' if degraded_co | length == 0 else 'Cluster Operators not healthy ' }}"
+          # - "Etcd OK: {{ 'ETCD is in healthy state' if (etcd_health is not failed and 'unhealthy' not in etcd_health.stdout) else 'No' }}"
+          - "MCP OK: {{ 'MachineConfigPool are healthy' if unhealthy_mcp | length == 0 else 'No' }}"

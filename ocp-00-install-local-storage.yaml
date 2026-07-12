@@ -1,0 +1,95 @@
+---
+- name: Local Storage Operator Installation
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+    kubeconfig_path: "/tmp/kubeconfig"
+    local_storage_namespace: openshift-local-storage
+    lso_channel: stable
+
+  tasks:
+    - name: Fail if kubeconfig is empty 
+      fail:
+        msg: "kubeconfig_b64 is empty or not defined"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+      
+    - name: Create kubeconfig file from base64
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "{{ kubeconfig_path }}"
+        mode: "0600"
+
+    - name: Ensure Local Storage Namespace exists 
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ local_storage_namespace }}"
+            labels:
+              openshift.io/cluster-monitoring: "true"
+              pod-security.kubernetes.io/enforce: privileged
+              pod-security.kubernetes.io/audit: privileged
+              pod-security.kubernetes.io/warn: privileged
+
+    - name: Create Local Storage OperatorGroup 
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            name: local-storage-operator-group
+            namespace: "{{ local_storage_namespace }}"
+          spec:
+            targetNamespaces: 
+              - "{{ local_storage_namespace }}"
+
+    - name: Create Subscription for Local Storage Operator
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: "{{ validate_certs }}"
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: local-storage-operator
+            namespace: "{{ local_storage_namespace }}"
+            labels:
+              controlled-by: Ansible
+          spec:
+            channel: "{{ lso_channel }}"
+            installPlanApproval: Automatic
+            name: local-storage-operator
+            source: redhat-operators
+            sourceNamespace: openshift-marketplace
+
+    - name: Wait for Local Storage Operator to Install
+      # Increased wait time to ensure the operator Pod is Running before next steps
+      pause:
+        minutes: 5
+
+    - name: Check Operator Status (Optional Debug)
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: "{{ validate_certs }}"
+        kind: ClusterServiceVersion
+        namespace: "{{ local_storage_namespace }}"
+      register: lso_csv
+      until: lso_csv.resources | length > 0 and lso_csv.resources[0].status.phase == "Succeeded"
+      retries: 10
+      delay: 10
+      ignore_errors: yes

@@ -1,0 +1,41 @@
+---
+- name: OpenShift Pre-Patch Health Check
+  hosts: intranet_clusters
+  gather_facts: no
+  connection: local
+  serial: 1
+  collections:
+    - kubernetes.core
+    - community.general
+
+  vars:
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+
+  tasks:
+    - name: Login to {{ cluster_id }}
+      command: >
+        oc login https://api.{{ inventory_hostname }}.{{ base_domain }}:{{ api_port }} -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      register: cluster_token
+      failed_when: false
+      no_log: true
+      changed_when: false
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+    - name: set token cleaner
+      ansible.builtin.set_fact:
+        api_token: "{{ cluster_token.stdout | trim }}"
+    - name: Approve All Pending CSRs
+      shell: "oc get csr -o name | xargs -r oc adm certificate approve"
+      register: approve_out
+    - name: Show results
+      debug:
+        msg: "{{ approve_out.stdout_lines if approve_out.stdout != '' else 'No CSR found to approve' }}"
+
+    - name: Approve All Pending CSRs
+      shell: "oc get csr -o name | xargs -r oc adm certificate approve"

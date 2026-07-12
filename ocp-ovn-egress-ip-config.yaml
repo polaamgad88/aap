@@ -1,0 +1,97 @@
+---
+- name: Create OVN EgressIP Resource
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+  vars:
+    cluster_name: "d07"
+    namespace_name: "aramco-test"
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+    egress_ip: "10.55.31.89" 
+    egress_nodes:
+      - "ocp-{{ cluster_name }}-wor01"
+      - "ocp-{{ cluster_name }}-wor02"
+  tasks:
+    - name: Set cluster_api based on cluster_name
+      set_fact:
+        cluster_api: |
+          {% if cluster_name == 'ibmdev' %}
+          https://api.{{ cluster_name }}.aramco.com:6443
+          {% else %}
+          https://api.{{ cluster_name }}.aramco.com.sa:6443
+          {% endif %}
+
+    - name: Login to OpenShift
+      command: >
+        oc login {{ cluster_api }}
+        -u {{ ldap_user }}
+        --password={{ ldap_password }}
+        --insecure-skip-tls-verify
+      register: cluster_token
+      failed_when: false
+      no_log: true
+      changed_when: false
+
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Set token cleaner
+      ansible.builtin.set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+
+    - name: Create Namespace
+      kubernetes.core.k8s:
+        state: present
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ namespace_name }}"
+            labels:
+              controlled-by: Ansible
+              egress-ip: "{{ namespace_name }}"
+
+    - name: Label Egress Nodes
+      kubernetes.core.k8s:
+        state: present
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        name: "{{ item }}"
+        definition:
+          apiVersion: v1
+          kind: Node
+          metadata:
+            labels:
+              k8s.ovn.org/egress-assignable: "true"
+      loop: "{{ egress_nodes }}"
+      ignore_errors: yes
+
+    - name: Create OVN EgressIP Resource
+      kubernetes.core.k8s:
+        state: present
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: k8s.ovn.org/v1
+          kind: EgressIP
+          metadata:
+            name: "egressip-{{ namespace_name }}"
+          spec:
+            egressIPs:
+              - "{{ egress_ip }}"
+            namespaceSelector:
+              matchLabels:
+                egress-ip: "{{ namespace_name }}"
+            podSelector: {}

@@ -1,0 +1,51 @@
+---
+- name: Authenticate to OpenShift using token and manage clusters
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+    - infra.quay_configuration
+  vars:
+    cluster_name: "s01"
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+
+  tasks:
+    - name: Set cluster_api based on cluster_name
+      set_fact:
+        cluster_api: |
+          {% if cluster_name == 'ibmdev' %}
+          https://api.{{ cluster_name }}.aramco.com:6443
+          {% else %}
+          https://api.{{ cluster_name }}.aramco.com.sa:6443
+          {% endif %}
+    - name: Login to paashub
+      command: >
+        oc login {{ cluster_api }} -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      register: cluster_token
+      failed_when: false
+      no_log: true
+      changed_when: false
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+    - name: set token cleaner
+      ansible.builtin.set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+    - name: Create nmstate namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: openshift-nmstate
+            labels:
+              controlled-by: Ansible
+          spec:
+            finalizers:
+              - kubernetes

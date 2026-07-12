@@ -1,0 +1,43 @@
+---
+- name: apply-ldap-whitelist
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+
+    - name: Whitelist
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ldap-group-syncer-whitelist
+            namespace: openshift-authentication
+          data:
+            whitelist.txt: |
+              CN=MA-OPENSHIFT-CLUSTER_ADMIN,OU=My Access,OU=Corporate
+              Resource Groups,OU=Corporate Accounts,DC=aramco,DC=com
+              CN=MA-OPENSHIFT-PaaS_Cluster_Admin_ReadOnly,OU=My Access,OU=Corporate Resource Groups,OU=Corporate Accounts,DC=aramco,DC=com
+              CN=MA-OPENSHIFT-PaaS_Admin_Prod,OU=My Access,OU=Corporate Resource Groups,OU=Corporate Accounts,DC=aramco,DC=com

@@ -1,0 +1,162 @@
+---
+- name: sync API Certificate 
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+  vars:
+
+    cluster_id: ""
+    kubeconfig_b64: ""
+    validate_certs: false
+
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+
+    kubeconfig_path: "/tmp/kubeconfig"
+    api_crt_path: "/tmp/tls.crt"
+    api_key_path: "/tmp/tls.key"
+
+
+    hub_secret_namespace: "aap"
+    route_governance_secret: "aramco-route-cert-governance"  
+    api_governance_secret: "aramco-api-cert-governance"
+    route_target_secret: "aramco-route-cert"    
+    api_target_secret: "aramco-api-cert"
+
+    api_dns_name: "api.{{ cluster_id }}.aramco.com.sa"
+
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "{{ kubeconfig_path }}"
+        mode: "0600"
+
+
+    # ----- Paashub cluster Section | get Secret ------ #
+    - name: Login to paashub
+      kubernetes.core.k8s_auth: 
+        host: "https://api.paashub.aramco.com.sa:6443"
+        username: "{{ ldap_user }}"
+        password: "{{ ldap_password }}"
+        validate_certs: false
+      register: hub_auth
+
+    - name: Read Route Certificate Governance Secret from hub
+      kubernetes.core.k8s_info:
+        host: "https://api.paashub.aramco.com.sa:6443"
+        api_key: "{{ hub_auth.k8s_auth.api_key }}"
+        validate_certs: false
+        api_version: v1
+        kind: Secret
+        namespace: "{{ hub_secret_namespace }}"
+        name: "{{ route_governance_secret }}"
+      register: route_secret_result
+
+
+    - name: Validate
+      assert:
+        that:
+          - route_secret_result.resources | length == 1
+          - route_secret_result.resources[0].data['tls.crt'] is defined
+          - route_secret_result.resources[0].data['tls.key'] is defined
+        
+
+    - name: Read api Certificate Governance Secret from hub
+      kubernetes.core.k8s_info:
+        host: "https://api.paashub.aramco.com.sa:6443"
+        api_key: "{{ hub_auth.k8s_auth.api_key }}"
+        validate_certs: false
+        api_version: v1
+        kind: Secret
+        namespace: "{{ hub_secret_namespace }}"
+        name: "{{ api_governance_secret }}"
+      register: api_secret_result
+
+
+    - name: Validate
+      assert:
+        that:
+          - api_secret_result.resources | length == 1
+          - api_secret_result.resources[0].data['tls.crt'] is defined
+          - api_secret_result.resources[0].data['tls.key'] is defined
+        
+    - name: Create Route TLS 
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: false
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ route_target_secret }}"
+            namespace: openshift-ingress
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ route_secret_result.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ route_secret_result.resources[0].data['tls.key'] }}"
+
+
+    - name: Create api TLS 
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        validate_certs: false
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ api_target_secret }}"
+            namespace: openshift-config
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ api_secret_result.resources[0].data['tls.crt'] }}"
+            tls.key: "{{ api_secret_result.resources[0].data['tls.key'] }}"
+    - name: Configure IngressController
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: operator.openshift.io/v1
+          kind: IngressController
+          metadata:
+            name: default
+            namespace: openshift-ingress-operator
+          spec:
+            defaultCertificate:
+              name: "{{ route_target_secret }}"
+ 
+    - name: Configure API Server
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        validate_certs: false
+        definition:
+          apiVersion: config.openshift.io/v1
+          kind: APIServer
+          metadata:
+            name: cluster
+          spec:
+            audit:
+              profile: Default
+            encryption:
+              type: aescbc
+            servingCerts:
+              namedCertificates:
+                - names:
+                    - "{{ api_dns_name }}"
+                  servingCertificate:
+                    name: "{{ api_target_secret }}"
+            tlsSecurityProfile:
+              type: Intermediate
+              intermediate: {}
+
+
+    

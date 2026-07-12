@@ -1,0 +1,99 @@
+---
+- name: Authenticate to OpenShift using token and manage clusters
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - kubernetes.core
+  vars:
+    cluster_id: ""
+    cluster_api: "https://api.{{ cluster_id }}.aramco.com.sa:6443"
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+  tasks:
+    - name: Login to {{ cluster_id }}
+      command: >
+        oc login {{ cluster_api }} -u {{ ldap_user }} -p {{ ldap_password }} --insecure-skip-tls-verify
+      register: cluster_token
+      failed_when: false
+      no_log: true
+      changed_when: false
+    - name: Get Token of automation user
+      command: oc whoami -t
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+    - name: set token cleaner
+      ansible.builtin.set_fact:
+        token: "{{ cluster_token.stdout | trim }}"
+    - name: Get Cluster Version of cluster
+      kubernetes.core.k8s_info:
+        host: "{{ cluster_api }}"
+        api_key: "{{ token }}"
+        api_version: config.openshift.io/v1
+        validate_certs: "{{ validate_certs }}"
+        kind: ClusterVersion
+        name: version
+      register: cv_info
+
+    - name: Set Cluster Version vars
+      ansible.builtin.set_fact:
+        current_id: "{{ cv_info.resources[0].spec.clusterID }}"
+        current_version: "{{ cv_info.resources[0].status.history[0].version }}"
+        current_image: "{{ cv_info.resources[0].status.history[0].image }}"
+        current_channel: "{{ cv_info.resources[0].spec.channel }}"
+        updates: "{{ cv_info.resources[0].status.availableUpdates | default([]) }}"
+        current_major_minor_version: "{{ cv_info.resources[0].status.history[0].version.split('.')[:2] | join('.') }}"
+        target_version: "{{ cv_info.resources[0].status.availableUpdates | map(attribute='version') | first }}"
+
+    - name: Set Cluster Version vars
+      ansible.builtin.set_fact:       
+        current_advisory: "{{ (updates[0].url | default('')) | regex_search('RHSA-[0-9]{4}:[0-9]{5}') | default('N/A') }}"
+
+
+    # - name: Get Advisory ID of current version
+    #   command: oc adm release info --insecure {{ cv_info.resources[0].status.desired.image }} -o jsonpath='{.metadata.metadata.url}'
+    #   register: tst
+    #   environment:
+    #     http_proxy: "http://cs-legging.aramco.com:8080"
+    #     https_proxy: "https://cs-legging.aramco.com:8080"
+
+    - name: Fetch CVEs
+      ansible.builtin.uri:
+        url: "https://access.redhat.com/hydra/rest/securitydata/cve.json?advisory={{ current_advisory }}"
+        method: GET
+        status_code: 200
+        return_content: true
+      register: cve_response
+      environment:
+        http_proxy: "http://cs-legging.aramco.com:8080"
+        https_proxy: "https://cs-legging.aramco.com:8080"
+      when: current_advisory != "N/A"
+
+    - name: Generate Security Report
+      ansible.builtin.debug:
+        msg:
+        - "========================================================="
+        - " Cluster Identification"
+        - "========================================================="
+        - "Cluster ID : {{ current_id }}"
+        - "API URL : {{ cluster_api }}"
+        - "Current Version  : {{ current_version }}"
+        - "Target Channel : stable-{{ current_major_minor_version }}"
+        - "Release Image  : {{ current_image }}"
+        - "Target Version : {{ target_version }}"
+        - "========================================================="
+        - "Security Advisory"
+        - "========================================================="
+        - "Advisory ID: {{ cve_response }}"
+        - "Advisory URL : https://access.redhat.com/errata/{{ current_advisory }}"
+        - "========================================================="
+        - "Available Updates"
+        - "========================================================="
+        - "{{ updates | map(attribute='version') | list }}"
+        - "========================================================="
+        - "CVE Details for current advisory"
+        - "========================================================="
+        - "{{ cve_response.json | default([]) | map(attribute='CVE') | list }}"
+        - "========================================================="

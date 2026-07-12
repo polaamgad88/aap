@@ -1,0 +1,36 @@
+---
+- name: Patch Cluster Proxy TrustedCA
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+    - name: Patch Cluster Proxy TrustedCA
+      kubernetes.core.k8s:
+        state: patched
+        kubeconfig: "/tmp/kubeconfig"
+        verify_ssl: "false"
+        api_version: config.openshift.io/v1
+        kind: Proxy
+        name: cluster
+        definition:
+          spec:
+            trustedCA:
+              name: user-ca-bundle

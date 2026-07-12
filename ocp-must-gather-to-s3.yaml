@@ -1,0 +1,133 @@
+---
+
+- name: Run Must-Gather and Upload to S3
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - amazon.aws
+  vars:
+    cluster_id: "helixprod"
+    cluster_api: "https://api.{{ cluster_id }}.aramco.com.sa:6443"
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    
+    # AWS & S3 Variables
+    aws_access_key: "eyOXL3cujLrrkC3SxiHI"
+    aws_secret_key: "868EqzFXUYhAA/sPHrtZHho+WvCsGaeTs4QHS4cO"
+    s3_endpoint_url: "https://s3.openshift-storage.svc:443"
+    s3_buket: "paashub-must-gather-vault-6774d623-c0b6-46dc-aa0b-5f14cd6f16b4"
+    
+    # Paths
+    backup_dir: "/tmp/{{ cluster_id }}/must-gather"
+    must_gather_dir: "{{ backup_dir }}/must-gather-output"
+    must_gather_archive: "{{ backup_dir }}/{{ cluster_id }}-must-gather.tar.gz"
+    
+    # S3 Path
+    s3_folder: "{{ cluster_id }}-must-gather"
+    s3_object_name: "{{ s3_folder }}/{{ cluster_id }}-must-gather.tar.gz"
+    
+    # Must Gather Config
+    # must_gather_image: "registry.redhat.io/openshift4/ose-tools-rhel8:latest"
+    # Give it enough time (in seconds) to gather data. Default is 120-300s.
+    gather_timeout: 3600 
+
+  tasks:
+
+    - name: Create Backup Directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Login to {{ cluster_api }}
+      command: >
+        oc login {{ cluster_api }} 
+        -u {{ ldap_user }} 
+        -p {{ ldap_password }} 
+        --insecure-skip-tls-verify
+      register: login_result
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Check Login Success
+      fail:
+        msg: "Failed to login to OpenShift cluster {{ cluster_id }}. Please check credentials."
+      when: login_result.rc != 0
+
+    - name: Clean previous gather output
+      file:
+        path: "{{ must_gather_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Run 'oc adm must-gather'
+      command: >
+        oc adm must-gather
+        --dest-dir={{ must_gather_dir }}
+      register: must_gather_result
+      failed_when: must_gather_result.rc != 0
+      changed_when: true
+      no_log: true
+
+    # - name: Check if Must-Gather produced files
+    #   stat:
+    #     path: "{{ must_gather_dir }}"
+    #   register: dir_stat
+
+    # - name: Fail if no files were gathered
+    #   assert:
+    #     that:
+    #       - dir_stat.stat.exists
+    #       - dir_stat.stat.isdir
+    #       - dir_stat.stat.nlink > 2  # A directory usually has at least 2 hard links (.) and (..)
+    #     fail_msg: "Must-gather command completed but produced no output. Check cluster connectivity and image pull permissions."
+    #   when: dir_stat.stat.isdir is defined
+
+    - name: Archive Must-Gather Output
+      shell: |
+        cd {{ backup_dir }}
+        tar -czf {{ cluster_id }}-must-gather.tar.gz -C {{ must_gather_dir }} .
+      register: tar_result
+      failed_when: tar_result.rc != 0
+
+    # - name: Check Archive Size
+    #   stat:
+    #     path: "{{ must_gather_archive }}"
+    #   register: archive_stat
+
+    # - name: Fail if Archive is Too Small
+    #   assert:
+    #     that:
+    #       - archive_stat.stat.size > 10240  # Must be at least 10MB
+    #     fail_msg: "Archive is suspiciously small ({{ archive_stat.stat.size }} bytes). The gather likely failed or collected nothing."
+    #   vars:
+    #     ansible_facts:
+    #       archive_size: "{{ archive_stat.stat.size }}"
+
+    - name: Upload Must-Gather Archive to S3
+      amazon.aws.s3_object:
+        bucket: "{{ s3_buket }}"
+        object: "{{ s3_object_name }}"
+        src: "{{ must_gather_archive }}"
+        mode: put
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        endpoint_url: "{{ s3_endpoint_url }}"
+        validate_certs: no
+        permission: private
+      register: s3_result
+
+    - name: Display Success
+      debug:
+        msg: "Upload successful. S3 Object: {{ s3_object_name }} (Size: {{ archive_stat.stat.size }} bytes)"
+      ignore_errors: yes
+    - name: Clean up Local Files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ must_gather_dir }}"
+        - "{{ must_gather_archive }}"
+      ignore_errors: yes
+

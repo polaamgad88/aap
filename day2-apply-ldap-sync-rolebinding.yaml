@@ -1,0 +1,46 @@
+---
+- name: day2-apply-ldap-sync-rolebinding
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+
+    - name: Create ClusterRoleBinding
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: ldap-group-syncer
+            labels:
+              app: cronjob-ldap-group-sync
+          subjects:
+            - name: ldap-group-syncer
+              namespace: openshift-authentication
+              kind: ServiceAccount
+          roleRef:
+            name: ldap-group-syncer
+            kind: ClusterRole
+            apiGroup: rbac.authorization.k8s.io

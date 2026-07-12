@@ -1,0 +1,89 @@
+---
+- name: Label Nodes
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+    infra_nodes: 
+      - "ocp-{{ cluster_id }}-inf01"
+      - "ocp-{{ cluster_id }}-inf02"
+    storage_nodes:
+      - "ocp-{{ cluster_id }}-odf01"
+      - "ocp-{{ cluster_id }}-odf02"
+      - "ocp-{{ cluster_id }}-odf03"
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+    - name: List Nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        api_version: v1
+        kind: Node
+      register: cluster_nodes_before
+      no_log: true
+    - name: show
+      debug:
+        msg:
+          - "{{ cluster_nodes_before.resources | map(attribute='metadata.name') | list }}"
+    - name: label Infras Nodes
+      kubernetes.core.k8s:
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        api_version: v1
+        kind: Node
+        state: patched
+        name: "{{ item }}"
+        definition:
+          metadata:
+            labels:
+              node-role.kubernetes.io/infra: ''
+              node-role.kubernetes.io/worker: null
+
+      loop: "{{ infra_nodes }}"
+    
+    - name: label Storage Nodes
+      kubernetes.core.k8s:
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        api_version: v1
+        kind: Node
+        state: patched
+        name: "{{ item }}"
+        definition:
+          metadata:
+            labels:
+              node-role.kubernetes.io/storage: ''
+              node-role.kubernetes.io/worker: null
+      loop: "{{ storage_nodes }}"
+    - name: List Nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        api_version: v1
+        kind: Node
+      register: cluster_nodes_after
+      no_log: true
+    - name: show
+      debug:
+        msg:
+          node: "{{ item.metadata.name }}"
+          labels: "{{ item.metadata.labels }}"
+      loop: "{{ cluster_nodes_after.resources }}"
+
+

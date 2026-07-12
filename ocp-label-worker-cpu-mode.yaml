@@ -1,0 +1,113 @@
+---
+- name: Label OpenShift Workers by IP Range (Multi-Cluster)
+  hosts: intranet_clusters
+  gather_facts: no
+  connection: local
+  serial: 1
+  vars:
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+    cluster_api: |
+      {% if inventory_hostname == 'ibmdev' %}
+      https://api.{{ inventory_hostname }}.aramco.com:6443
+      {% else %}
+      https://api.{{ inventory_hostname }}.aramco.com.sa:6443
+      {% endif %}
+  tasks:
+    # --- Step 1: Login to OpenShift ---
+    - name: Login to OpenShift ({{ inventory_hostname }})
+      command: >
+        oc login {{ cluster_api }}
+        -u {{ ldap_user }}
+        --password={{ ldap_password }}
+        --insecure-skip-tls-verify
+      register: login_result
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Fail if login failed
+      fail:
+        msg: "Failed to login to {{ inventory_hostname }}. Please check credentials."
+      when: login_result.rc != 0
+
+    - name: Get Token of automation user ({{ inventory_hostname }})
+      command: oc whoami --show-token
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Set token cleaner for {{ inventory_hostname }}
+      set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+
+    - name: Fail if token is empty for {{ inventory_hostname }}
+      fail:
+        msg: "Failed to get token for {{ inventory_hostname }}. Token is empty."
+      when: openshift_cluster_token is not defined or openshift_cluster_token | length == 0
+
+    - name: Check if user can access nodes ({{ inventory_hostname }})
+      command: oc auth can-i get nodes
+      register: auth_check
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Fail if user lacks node permissions
+      fail:
+        msg: "User {{ ldap_user }} does not have permission to read nodes on {{ inventory_hostname }}. Please grant 'cluster-admin' or 'view' permissions."
+      when: auth_check.stdout != "yes"
+
+    - name: Get Worker Nodes for {{ inventory_hostname }}
+      kubernetes.core.k8s_info:
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        kind: Node
+        label_selectors:
+          - "node-role.kubernetes.io/worker"
+      register: worker_nodes
+
+    # --- Step 5: Prepare Label Data ---
+    - name: Create a list of nodes with their calculated labels for {{ inventory_hostname }}
+      set_fact:
+        nodes_to_label: "{{ nodes_to_label | default([]) + [ {
+          'name': item.metadata.name,
+          'ip': (item.status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first | default('')),
+          'label': (
+            (item.status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first | default('') | regex_search('^10\\.55') or
+             item.status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first | default('') | regex_search('^10\\.1\\.84') or
+             item.status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first | default('') | regex_search('^10\\.1\\.83')) | ternary('virtual',
+             (item.status.addresses | selectattr('type', 'equalto', 'InternalIP') | map(attribute='address') | first | default('') | regex_search('^10\\.54') | ternary('physical', 'skip')))
+          )
+        } ] }}"
+      loop: "{{ worker_nodes.resources }}"
+      no_log: true
+
+    # --- Step 6: Label Nodes ---
+    - name: Label nodes based on IP ({{ inventory_hostname }})
+      kubernetes.core.k8s:
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        state: patched
+        definition:
+          apiVersion: v1
+          kind: Node
+          metadata:
+            name: "{{ item.name }}"
+            labels:
+              cpu-mode: "{{ item.label }}"
+      loop: "{{ nodes_to_label }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.label != 'skip'
+
+    # --- Step 7: Summary per Cluster ---
+    - name: Show Labeling Summary for {{ inventory_hostname }}
+      debug:
+        msg: "Cluster: {{ inventory_hostname }} | Node: {{ item.name }} | IP: {{ item.ip }} | Label: {{ item.label }}"
+      loop: "{{ nodes_to_label }}"
+      when: item.label != 'skip'

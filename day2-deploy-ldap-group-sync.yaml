@@ -1,0 +1,106 @@
+---
+- name: day2-deploy-ldap-group-sync
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    ldap_user: ""
+    ldap_password: ""
+    validate_certs: false
+    cluster_id: ""
+    kubeconfig_b64: ""
+
+  tasks:
+    - name: fail if kubeconfig is empty 
+      fail:
+        msg: "EMPTY"
+      when: kubeconfig_b64 is not defined or kubeconfig_b64 | trim == ""
+    - name: create kubeconfig file
+      copy:
+        content: "{{ kubeconfig_b64 | trim | b64decode }}"
+        dest: "/tmp/kubeconfig"
+        mode: "0600"
+    - name: Ensure Namepsace exist 
+      kubernetes.core.k8s:
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: false
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: openshift-authentication
+
+    - name: Apply Ldap group sync cronjob
+      kubernetes.core.k8s:
+        state: present
+        validate_certs: false
+        kubeconfig: "/tmp/kubeconfig"
+        validate_certs: "{{ validate_certs }}"
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: ldap-group-syncer
+            namespace: openshift-authentication
+            labels:
+              app: cronjob-ldap-group-sync
+              controlled-by: Ansible
+          spec:
+            schedule: "*/59 * * * *"
+            successfulJobsHistoryLimit: 5    
+            concurrencyPolicy: Forbid
+            failedJobsHistoryLimit: 5
+            jobTemplate:
+              metadata:
+                labels:
+                  app: cronjob-ldap-group-sync
+              spec:
+                backoffLimit: 0
+                template:
+                  metadata:
+                    labels:
+                      app: cronjob-ldap-group-sync
+                  spec:
+                    activeDeadlineSeconds: 500
+                    containers:
+                      - name: ldap-group-sync
+                        image: registry.redhat.io/openshift4/ose-cli:v4.7
+                        command:
+                          - /bin/bash
+                          - -c
+                          - oc adm groups sync
+                            --whitelist=/etc/whitelist/whitelist.txt
+                            --sync-config=/etc/config/ldap-group-sync.yaml
+                            --confirm
+                        volumeMounts:
+                          - name: ldap-sync-volume
+                            mountPath: /etc/config
+                          - name: ldap-sync-volume-whitelist
+                            mountPath: /etc/whitelist
+                          - name: ldap-bind-password
+                            mountPath: /etc/secrets
+                          - name: ldap-ca
+                            mountPath: /etc/ldap-ca
+                    dnsPolicy: ClusterFirst
+                    restartPolicy: Never
+                    serviceAccount: ldap-group-syncer
+                    serviceAccountName: ldap-group-syncer
+                    terminationGracePeriodSeconds: 30
+                    volumes:
+                      - name: ldap-ca
+                        configMap:
+                          name: v4-0-config-system-trusted-ca-bundle
+                      - name: ldap-sync-volume
+                        configMap:
+                          name: ldap-group-syncer
+                      - name: ldap-sync-volume-whitelist
+                        configMap:
+                          name: ldap-group-syncer-whitelist
+                      - name: ldap-bind-password
+                        secret:
+                          secretName: v4-0-config-user-idp-0-bind-password
+  

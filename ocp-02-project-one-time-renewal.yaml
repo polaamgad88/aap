@@ -1,0 +1,153 @@
+---
+- name: Namespace Certification Renewal (Max +6 Months from Current)
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  vars:
+    ldap_user: "{{ ansible_user }}"
+    ldap_password: "{{ ansible_password }}"
+    validate_certs: false
+    cluster_id: ""
+    target_namespace: "{{ target_namespace }}"
+    
+    # Cluster API URL logic
+    cluster_api: |
+      {% if cluster_id == 'ibmdev' %}
+      https://api.{{ cluster_id }}.aramco.com:6443
+      {% else %}
+      https://api.{{ cluster_id }}.aramco.com.sa:6443
+      {% endif %}
+
+  tasks:
+    # --- Step 0: Calculate Dates ---
+    - name: Get today's date
+      command: date +%Y-%m-%d
+      changed_when: false
+      register: today_cmd
+
+    - name: Set today's date fact
+      set_fact:
+        today_date: "{{ today_cmd.stdout | trim }}"
+
+    - name: Calculate Max Renewal Date (Today + 6 Months)
+      command: date -d "+6 months" +%Y-%m-%d
+      changed_when: false
+      register: max_renewal_cmd
+
+    - name: Set max renewal date fact
+      set_fact:
+        max_renewal_date: "{{ max_renewal_cmd.stdout | trim }}"
+        target_status: "certified"
+
+    # --- Step 1: Authenticate ---
+    - name: Login to OpenShift ({{ cluster_id }})
+      command: >
+        oc login {{ cluster_api }}
+        -u {{ ldap_user }}
+        --password={{ ldap_password }}
+        --insecure-skip-tls-verify
+      register: login_result
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if login failed
+      fail:
+        msg: "Failed to login to {{ cluster_id }}. Please check credentials."
+      when: login_result.rc != 0
+
+    - name: Get Token for automation user
+      command: oc whoami --show-token
+      register: cluster_token
+      changed_when: false
+      failed_when: false
+
+    - name: Set token fact
+      set_fact:
+        openshift_cluster_token: "{{ cluster_token.stdout | trim }}"
+      when: cluster_token.rc == 0
+
+    - name: Fail if token retrieval failed
+      fail:
+        msg: "Failed to retrieve token from cluster {{ cluster_id }}."
+      when: openshift_cluster_token is not defined or openshift_cluster_token | length == 0
+
+    # --- Step 2: Fetch Current Namespace State ---
+    - name: Get Namespace details ({{ target_namespace }})
+      kubernetes.core.k8s_info:
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        kind: Namespace
+        name: "{{ target_namespace }}"
+      register: namespace_info
+      ignore_errors: yes
+
+    - name: Fail if namespace does not exist
+      fail:
+        msg: "Namespace '{{ target_namespace }}' not found on cluster {{ cluster_id }}."
+      when: namespace_info.failed or namespace_info.resources | length == 0
+
+    - name: Extract current labels
+      set_fact:
+        ns_name: "{{ namespace_info.resources[0].metadata.name }}"
+        current_status: "{{ namespace_info.resources[0].metadata.labels.get('certification-status', 'missing') }}"
+        current_expiry: "{{ namespace_info.resources[0].metadata.labels.get('expiry-date', 'missing') }}"
+      no_log: true
+
+    # --- Step 3: Enforce Renewal Policy ---
+    # Policy: Allow renewal ONLY if the current expiry date is <= 6 months from today.
+    - name: Check if current expiry is within allowable window
+      set_fact:
+        # If current expiry is 'missing' (new NS) or <= max_renewal_date, it is eligible
+        is_eligible: "{{ current_expiry == 'missing' or current_expiry <= max_renewal_date }}"
+      no_log: true
+
+    - name: Debug Renewal Eligibility
+      debug:
+        msg: >
+          Namespace: {{ ns_name }} |
+          Current Expiry: {{ current_expiry }} |
+          Today: {{ today_date }} |
+          Max Allowed Expiry: {{ max_renewal_date }} |
+          Eligible: {{ is_eligible }}
+      no_log: true
+
+    - name: Fail if renewal is not eligible (Date too far in future)
+      fail:
+        msg: >
+          Renewal NOT allowed for namespace '{{ ns_name }}'.
+          Current expiry date is '{{ current_expiry }}', which is more than 6 months from today.
+          You can only renew if the expiry date is within 6 months of today.
+      when: not is_eligible
+      no_log: true
+
+    # --- Step 4: Apply Patch ---
+    - name: Prepare patch definition
+      set_fact:
+        patch_definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ ns_name }}"
+            labels:
+              certification-status: "{{ target_status }}"
+              expiry-date: "{{ max_renewal_date }}"
+      no_log: true
+
+    - name: Update Namespace Labels
+      kubernetes.core.k8s:
+        api_key: "{{ openshift_cluster_token }}"
+        host: "{{ cluster_api }}"
+        validate_certs: "{{ validate_certs }}"
+        state: patched
+        definition: "{{ patch_definition }}"
+      register: patch_result
+
+    # --- Step 5: Report ---
+    - name: Report Status
+      debug:
+        msg: >
+          Cluster: {{ cluster_id }} |
+          Namespace: {{ ns_name }} |
+          Action: {{ 'Renewed' if patch_result.changed else 'No Change Needed' }} |
+          New Expiry: {{ max_renewal_date }}
