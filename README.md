@@ -4,7 +4,7 @@ This repository contains a comprehensive suite of Ansible playbooks designed to 
 
 ---
 
-## 🛠️ Automated Operations & Scope
+##  Automated Operations & Scope
 
 ### 1. Identity & Access Management (IAM)
 * **LDAP Integration:** Automated LDAP secret binding, group/role synchronization, and whitelist rule application.
@@ -41,7 +41,7 @@ This repository contains a comprehensive suite of Ansible playbooks designed to 
 
 ---
 
-## 📋 Technology Stack & Domain Coverage
+##  Technology Stack & Domain Coverage
 
 * **Orchestration:** Ansible Automation Platform / Ansible Engine
 * **Container Platform:** Red Hat OpenShift Container Platform (OCP) 4.x
